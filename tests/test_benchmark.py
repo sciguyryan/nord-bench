@@ -157,3 +157,58 @@ class FilterTests(unittest.TestCase):
                 b.main(["--config-dir", directory, "--filter=!(uk|us)"])
             self.assertEqual(error.exception.code, 2)
             stage.assert_not_called()
+
+
+class RegionAndRankingTests(unittest.TestCase):
+    def test_country_lookup_and_alias(self):
+        from nordvpn_regions import country_name
+
+        self.assertEqual(country_name("nl828.nordvpn.com"), "Netherlands")
+        self.assertEqual(country_name("uk2108.nordvpn.com"), "United Kingdom")
+        self.assertEqual(country_name("custom.example"), "Unknown")
+
+    def test_curated_region_filter_and_override(self):
+        import json
+        from nordvpn_regions import load_region_lists
+        from nordvpn_filter import compile_filter
+
+        regions = load_region_lists()
+        self.assertEqual(regions["low-ads"]["countries"], ["ad", "al", "bs", "bz", "mc", "pg", "tt", "uz"])
+        endpoint = b.Endpoint("ad12.ovpn", "1.2.3.4", 53, "udp", "ad12.nordvpn.com")
+        self.assertTrue(compile_filter("list:low-ads", regions)(endpoint))
+        with tempfile.TemporaryDirectory() as folder:
+            file = Path(folder) / "regions.json"
+            file.write_text(json.dumps({"low-ads": {"description": "Custom", "countries": ["nl"]}}))
+            overridden = load_region_lists(file)
+            self.assertFalse(compile_filter("list:low-ads", overridden)(endpoint))
+            file.write_text(json.dumps({"bad": {"description": "Duplicate", "countries": ["nl", "nl"]}}))
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                load_region_lists(file)
+
+    def test_distinct_server_ranking_retains_full_export_records(self):
+        endpoints = [b.Endpoint("nl828.ovpn", "1.2.3.4", port, "udp", "nl828.nordvpn.com") for port in (53, 1231, 1232)]
+        endpoints.append(b.Endpoint("nl825.ovpn", "1.2.3.5", 53, "udp", "nl825.nordvpn.com"))
+        measurements = {host: b.Measurement(host, 3, [10, 11, 12]) for host in ("1.2.3.4", "1.2.3.5")}
+        records = b.records_for(endpoints, measurements)
+        self.assertEqual(len(records), 4)
+        distinct = b.distinct_servers(records)
+        self.assertEqual(len(distinct), 2)
+        self.assertIn("Netherlands", b.format_results(distinct, 2, True))
+
+
+class CuratedLowAdsTests(unittest.TestCase):
+    def test_builtin_list_matches_verified_nordvpn_shortlist(self):
+        from nordvpn_regions import load_region_lists
+
+        group = load_region_lists()["low-ads"]
+        self.assertEqual(set(group["countries"]), {"ad", "al", "bs", "bz", "mc", "pg", "tt", "uz"})
+
+    def test_low_ads_filter_matches_nordvpn_country(self):
+        from nordvpn_filter import compile_filter
+        from nordvpn_regions import load_region_lists
+
+        matcher = compile_filter("list:low-ads", load_region_lists())
+        andorra = b.Endpoint("ad1.ovpn", "192.0.2.1", 53, "udp", "ad1.nordvpn.com")
+        netherlands = b.Endpoint("nl1.ovpn", "192.0.2.2", 53, "udp", "nl1.nordvpn.com")
+        self.assertTrue(matcher(andorra))
+        self.assertFalse(matcher(netherlands))

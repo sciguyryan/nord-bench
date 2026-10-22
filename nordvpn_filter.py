@@ -21,7 +21,7 @@ def server_identity(filename: str) -> str:
     return match.group(1).lower() if match else Path(filename).name
 
 
-def compile_filter(expression: str):
+def compile_filter(expression: str, region_lists: dict | None = None):
     """Compile !, &, | and parentheses, with NOT > AND > OR precedence."""
     tokens = list(re.finditer(r"\s+|[!&|()]|[^\s!&|()]+", expression))
     items = [(m.group(), m.start()) for m in tokens if not m.group().isspace()]
@@ -59,10 +59,12 @@ def compile_filter(expression: str):
             fail("use a two-letter country, server ID or explicit field", pos)
         field = field.lower()
         pattern = pattern.lower()
-        if field not in ("country", "server", "host", "protocol", "port") or not pattern:
+        if field not in ("country", "server", "host", "protocol", "port", "list") or not pattern:
             fail("unknown or empty field", pos)
         if field in ("country", "protocol", "port") and "*" in pattern:
             fail("wildcards are supported only for server and host", pos)
+        if field == "list" and (region_lists is None or pattern not in region_lists):
+            fail("unknown region list", pos)
         if field == "country" and not re.fullmatch(r"[a-z]{2}", pattern):
             fail("country must be a two-letter code", pos)
         if field == "protocol" and pattern not in ("udp", "tcp"):
@@ -77,6 +79,8 @@ def compile_filter(expression: str):
             match = re.fullmatch(r"([a-z]{2}\d+)\.nordvpn\.com", hostname)
             server = match.group(1) if match else ""
             country = server[:2] if server else ""
+            if field == "list":
+                return country in region_lists[pattern]["countries"]
             value = {
                 "country": country,
                 "server": server,
@@ -100,9 +104,17 @@ def compile_filter(expression: str):
             right = expr(precedence + 1)
             previous = left
             if operator == "&":
-                left = lambda endpoint, a=previous, b=right: a(endpoint) and b(endpoint)
+
+                def conjunction(endpoint, a=previous, b=right):
+                    return a(endpoint) and b(endpoint)
+
+                left = conjunction
             else:
-                left = lambda endpoint, a=previous, b=right: a(endpoint) or b(endpoint)
+
+                def disjunction(endpoint, a=previous, b=right):
+                    return a(endpoint) or b(endpoint)
+
+                left = disjunction
         return left
 
     if not items:

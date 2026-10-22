@@ -23,6 +23,7 @@ from urllib.request import urlopen
 import zipfile
 
 from nordvpn_filter import compile_filter, FilterSyntaxError, server_identity
+from nordvpn_regions import country_name, load_region_lists
 
 ARCHIVE_URL = "https://downloads.nordcdn.com/configs/archives/servers/ovpn.zip"
 PRESETS = {"fast": (2, 6), "balanced": (3, 12), "thorough": (5, 25)}
@@ -316,6 +317,7 @@ def records_for(endpoints, measurements):
         records.append(
             {
                 "server": endpoint.name,
+                "country": country_name(endpoint.name),
                 "config_file": Path(endpoint.file).name,
                 "address": endpoint.host,
                 "port": endpoint.port,
@@ -331,7 +333,17 @@ def records_for(endpoints, measurements):
                 "error": m.error,
             }
         )
-    return sorted(records, key=lambda r: rank(measurements[r["address"]]) + (r["protocol"], r["port"], r["server"]))
+    ordered = sorted(records, key=lambda r: rank(measurements[r["address"]]) + (r["server"], r["protocol"], r["port"]))
+    # One displayed rank per canonical server and measured address. Keep all
+    # configuration records separately for lossless CSV/JSON exports.
+    return ordered
+
+
+def distinct_servers(records):
+    unique = {}
+    for record in records:
+        unique.setdefault((record["server"], record["address"]), record)
+    return list(unique.values())
 
 
 def export(records, path, fmt, ascii_only):
@@ -348,13 +360,14 @@ def export(records, path, fmt, ascii_only):
 
 
 def format_results(records, top, ascii_only, *, colour=False, colourblind=False):
-    headers = ["#", "Server", "Transport", "IP", "Port", "Mean", "Median", "MAD", "Loss", "Samples", "Stage"]
+    headers = ["#", "Server", "Country", "Transport", "IP", "Port", "Mean", "Median", "MAD", "Loss", "Samples", "Stage"]
     rows = []
     for index, r in enumerate(records[:top], 1):
         rows.append(
             [
                 index,
                 r["server"],
+                r.get("country", "Unknown"),
                 r["protocol"],
                 r["address"],
                 r["port"],
@@ -376,7 +389,7 @@ def format_results(records, top, ascii_only, *, colour=False, colourblind=False)
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group()
     source.add_argument("--config-dir", type=Path)
     source.add_argument("--download", action="store_true")
     parser.add_argument("--protocol", choices=("udp", "tcp", "both"), default="udp")
@@ -387,6 +400,9 @@ def main(argv=None):
         metavar="EXPR",
         help="filter configurations; repeated expressions are combined with AND",
     )
+    parser.add_argument("--region-list", action="append", default=[], metavar="NAME")
+    parser.add_argument("--region-lists-file", type=Path, metavar="PATH")
+    parser.add_argument("--list-region-lists", action="store_true")
     parser.add_argument("--accuracy", choices=tuple(PRESETS), default="balanced")
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--workers", type=int, default=24)
@@ -412,6 +428,8 @@ def main(argv=None):
         help="allow replacing an existing NordVPN connection without prompting",
     )
     args = parser.parse_args(argv)
+    if not args.list_region_lists and not (args.download or args.config_dir):
+        parser.error("one of --download or --config-dir is required")
     if args.top < 1 or not 1 <= args.workers <= 128 or not 0.1 <= args.timeout <= 30:
         parser.error("--top must be positive, --workers 1..128, --timeout 0.1..30")
     if args.connect_rank < 1 or (args.auto_connect and args.connect_rank > args.top):
@@ -419,8 +437,17 @@ def main(argv=None):
     if (args.connect_rank != 1 or args.replace_connection) and not args.auto_connect:
         parser.error("--connect-rank and --replace-connection require --auto-connect")
     try:
-        filters = [compile_filter(expression) for expression in args.filter]
-    except FilterSyntaxError as exc:
+        region_lists = load_region_lists(args.region_lists_file)
+        if args.list_region_lists:
+            for name, item in sorted(region_lists.items()):
+                print(f"{name}: {', '.join(item['countries'])} ({item['description']})")
+            return 0
+        for name in args.region_list:
+            if name not in region_lists:
+                parser.error(f"unknown region list: {name}")
+        filters = [compile_filter(expression, region_lists) for expression in args.filter]
+        filters.extend(compile_filter(f"list:{name}", region_lists) for name in args.region_list)
+    except (FilterSyntaxError, ValueError, OSError, json.JSONDecodeError) as exc:
         parser.error(f"invalid --filter: {exc}")
     if shutil.which("ping") is None:
         parser.error("system ping utility is required")
@@ -472,9 +499,10 @@ def main(argv=None):
                 initial.stage = "refined"
                 initial.error = "" if initial.samples else extra.error
             records = records_for(endpoints, measurements)
+            ranked = distinct_servers(records)
             print(
                 format_results(
-                    records,
+                    ranked,
                     args.top,
                     args.ascii,
                     colour=not args.no_colour and terminal_colour_enabled(),
@@ -483,7 +511,7 @@ def main(argv=None):
             )
             if args.output:
                 destination = args.output.expanduser()
-                export(records, destination, args.format, args.ascii)
+                export(records if args.format in ("csv", "json") else ranked, destination, args.format, args.ascii)
                 if not args.quiet:
                     print(f"Wrote {len(records)} results to {destination}", file=sys.stderr)
             if args.auto_connect:
@@ -498,7 +526,7 @@ def main(argv=None):
                     return answer.strip().lower() in ("y", "yes")
 
                 try:
-                    connect(records, args.connect_rank, replace_existing=args.replace_connection, confirm=confirm)
+                    connect(ranked, args.connect_rank, replace_existing=args.replace_connection, confirm=confirm)
                 except ConnectionError as exc:
                     print(f"Connection error: {exc}", file=sys.stderr)
                     return 2

@@ -122,3 +122,41 @@ The benchmarker checks for `nordvpn`, reads its connection status, and derives a
 After issuing `nordvpn connect SERVER`, the script checks `nordvpn status` and requires the reported server to match the requested server. A failed connection returns a non-zero exit status without discarding an export already written. The client must already be installed, configured and logged in. No credentials are handled by this script, and it does not change NordVPN's configured VPN technology. Consequently, the resulting VPN transport may differ from the OpenVPN profile used for ICMP discovery. The client may also refuse a server identifier that is no longer available.
 
 The status parser currently recognises English `Status:` and `Current server:` output. Other client versions and localisations need testing; an unrecognised response causes the connection operation to stop rather than guessing. Actual client integration has not yet been verified on a live NordVPN session.
+
+## Continuous integration and formatting
+
+GitHub Actions runs the unit tests and checks Python source formatting on pushes and pull requests. Ruff is pinned to version 0.14.2 for consistent CI behaviour. To apply its formatting locally before committing, run:
+
+```bash
+python -m pip install 'ruff==0.14.2'
+ruff format .
+ruff format --check --diff .
+python -m unittest discover -s tests -v
+```
+
+The CI formatting check is deliberately read-only and fails if source files need formatting. It does not automatically rewrite committed code.
+
+## Country names and named region lists
+
+The Country column is derived from NordVPN's server identifier. Country names come from the bundled `country_names.json` snapshot, generated from `pycountry`'s ISO 3166 data during development. The runtime does not need `pycountry` or a geolocation service. NordVPN's `uk` prefix is mapped to the United Kingdom; the prefix represents NordVPN's advertised location, not independent evidence of physical server placement.
+
+The bundled `region-lists.json` provides a curated, experimental `low-ads` group containing Andorra (`ad`), Albania (`al`), the Bahamas (`bs`), Belize (`bz`), Monaco (`mc`), Papua New Guinea (`pg`), Trinidad and Tobago (`tt`) and Uzbekistan (`uz`). These locations were selected from NordVPN’s advertised server countries with reference to YouTube’s published monetised-market list. This is a practical shortlist for testing whether YouTube serves fewer adverts, not a general advertising classification, an ad blocker or a guarantee. The list is maintained for NordVPN specifically. An advertised NordVPN location does not necessarily have a usable OpenVPN profile in the current archive, and actual advertising behaviour can change.
+
+Sources for maintaining this curated list: https://nordvpn.com/servers/ and https://support.google.com/youtube/answer/1342206. Review both when updating the list; do not add countries solely because another VPN provider offers them.
+
+```bash
+python nordvpn_benchmark.py --download --region-list low-ads
+python nordvpn_benchmark.py --download --filter='list:low-ads|country:nl'
+python nordvpn_benchmark.py --list-region-lists
+python nordvpn_benchmark.py --download --region-lists-file ~/.config/nordvpn-benchmark/regions.json --region-list low-ads
+```
+
+Custom JSON files have the same shape as the bundled catalogue: an object mapping group names to objects with a `description` string and a `countries` array of lowercase two-letter codes. Custom groups override built-in groups of the same name rather than merging them. Invalid codes, duplicate countries and malformed definitions are rejected before probing. Multiple `--region-list` options are combined using AND, like repeated `--filter` options.
+
+## Distinct-server results
+
+The terminal table displays one rank per canonical hostname and destination IP, rather than repeating the same ICMP measurement for each OpenVPN port. Where a hostname resolves to different measured IP addresses, those endpoints remain distinct. `--top` and `--connect-rank` refer to the displayed ranking. CSV and JSON exports continue to include every configuration and port, since ICMP does not test whether a particular OpenVPN port is available.
+
+## Development checks
+
+The GitHub Actions workflow runs the unit tests, `ruff check .` and `ruff format --check --diff .`, with Ruff pinned to version 0.14.2. Run the same commands locally before committing; the entry-point script must retain its executable bit in Git.

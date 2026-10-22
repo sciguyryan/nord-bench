@@ -48,9 +48,11 @@ class ConnectionTests(unittest.TestCase):
     @patch.object(c.sys, "platform", "linux")
     @patch.object(c.shutil, "which", return_value="/usr/bin/nordvpn")
     def test_unrecognised_status_fails_closed(self, _which):
-        with patch.object(c, "run_client", return_value=self.result("Something changed\n")):
-            with self.assertRaisesRegex(c.ConnectionError, "not recognised"):
-                c.connect(self.rows, 1)
+        with (
+            patch.object(c, "run_client", return_value=self.result("Something changed\n")),
+            self.assertRaisesRegex(c.ConnectionError, "not recognised"),
+        ):
+            c.connect(self.rows, 1)
 
     @patch.object(c.sys, "platform", "linux")
     @patch.object(c.shutil, "which", return_value="/usr/bin/nordvpn")
