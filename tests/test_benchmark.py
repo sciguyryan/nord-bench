@@ -173,7 +173,10 @@ class RegionAndRankingTests(unittest.TestCase):
         from nordvpn_filter import compile_filter
 
         regions = load_region_lists()
-        self.assertEqual(regions["low-ads"]["countries"], ["ad", "al", "bs", "bz", "mc", "pg", "tt", "uz"])
+        self.assertEqual(
+            regions["low-ads"]["countries"],
+            ["ad", "al", "ao", "bn", "bs", "bt", "bz", "gl", "im", "je", "mc", "mm", "mn", "mz", "pg", "tt", "uz"],
+        )
         endpoint = b.Endpoint("ad12.ovpn", "1.2.3.4", 53, "udp", "ad12.nordvpn.com")
         self.assertTrue(compile_filter("list:low-ads", regions)(endpoint))
         with tempfile.TemporaryDirectory() as folder:
@@ -201,7 +204,31 @@ class CuratedLowAdsTests(unittest.TestCase):
         from nordvpn_regions import load_region_lists
 
         group = load_region_lists()["low-ads"]
-        self.assertEqual(set(group["countries"]), {"ad", "al", "bs", "bz", "mc", "pg", "tt", "uz"})
+        self.assertEqual(
+            set(group["countries"]),
+            {"ad", "al", "ao", "bn", "bs", "bt", "bz", "gl", "im", "je", "mc", "mm", "mn", "mz", "pg", "tt", "uz"},
+        )
+
+    def test_low_ads_codes_are_sorted_unique_and_iso_recognised(self):
+        from nordvpn_regions import load_region_lists, normalise_country_code
+
+        codes = load_region_lists()["low-ads"]["countries"]
+        self.assertEqual(codes, sorted(set(codes)))
+        self.assertTrue(all(normalise_country_code(code) == code for code in codes))
+
+    def test_new_low_ads_locations_match_and_monetised_exceptions_do_not(self):
+        from nordvpn_filter import compile_filter
+        from nordvpn_regions import load_region_lists
+
+        matcher = compile_filter("list:low-ads", load_region_lists())
+        for code in ("ao", "bn", "bt", "gl", "im", "je", "mm", "mn", "mz"):
+            with self.subTest(country=code):
+                endpoint = b.Endpoint(f"{code}1.ovpn", "192.0.2.1", 53, "udp", f"{code}1.nordvpn.com")
+                self.assertTrue(matcher(endpoint))
+        for code in ("am", "la", "np", "lk"):
+            with self.subTest(country=code):
+                endpoint = b.Endpoint(f"{code}1.ovpn", "192.0.2.2", 53, "udp", f"{code}1.nordvpn.com")
+                self.assertFalse(matcher(endpoint))
 
     def test_low_ads_filter_matches_nordvpn_country(self):
         from nordvpn_filter import compile_filter
