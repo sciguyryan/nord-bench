@@ -12,7 +12,7 @@ from pathlib import Path
 import pycountry
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT = ROOT / "country_names.json"
+OUTPUT = ROOT / "country-names.json"
 
 
 def render() -> str:
@@ -27,7 +27,7 @@ def main() -> int:
     expected = render()
     if args.check:
         if not OUTPUT.exists() or OUTPUT.read_text(encoding="utf-8") != expected:
-            parser.exit(1, "country_names.json differs from generated ISO data; regenerate it\n")
+            parser.exit(1, "country-names.json differs from generated ISO data; regenerate it\n")
         return 0
     OUTPUT.write_text(expected, encoding="utf-8")
     return 0

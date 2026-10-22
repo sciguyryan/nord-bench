@@ -318,3 +318,38 @@ class EarlyFilterTests(unittest.TestCase):
             profiles = list((root / "profiles").glob("*.ovpn"))
             self.assertEqual(len(profiles), 1)
             self.assertIn("ad1.nordvpn.com", profiles[0].name)
+
+
+class CountryFlagTests(unittest.TestCase):
+    def test_flags_and_aliases(self):
+        from nordvpn_regions import country_flag
+
+        self.assertEqual(country_flag("uk2108.nordvpn.com"), "🇬🇧")
+        self.assertEqual(country_flag("gb1.nordvpn.com"), "🇬🇧")
+        self.assertEqual(country_flag("al1.nordvpn.com"), "🇦🇱")
+        self.assertEqual(country_flag("custom.example"), "")
+        self.assertEqual(country_flag("zz1.nordvpn.com"), "")
+
+    def test_table_flags_and_ascii_fallback(self):
+        record = {
+            "server": "uk2108.nordvpn.com",
+            "country": "United Kingdom",
+            "protocol": "udp",
+            "address": "192.0.2.1",
+            "port": 1194,
+            "mean_ms": 10.0,
+            "median_ms": 10.0,
+            "jitter_mad_ms": 0.0,
+            "loss_pct": 0.0,
+            "received": 3,
+            "sent": 3,
+            "stage": "initial",
+        }
+        unicode_table = b.format_results([record], 1, False)
+        ascii_table = b.format_results([record], 1, True)
+        self.assertIn("🇬🇧 United Kingdom", unicode_table)
+        self.assertNotIn("🇬🇧", ascii_table)
+        self.assertIn("United Kingdom", ascii_table)
+        self.assertEqual(b.display_width("🇬🇧 United Kingdom"), len("   United Kingdom"))
+        # All rows retain the same number of separators.
+        self.assertEqual(len({line.count("│") for line in unicode_table.splitlines() if "│" in line}), 1)

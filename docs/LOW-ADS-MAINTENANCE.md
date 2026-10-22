@@ -55,7 +55,7 @@ All 17 prefixes appeared in the user-supplied NordVPN OpenVPN directory listing 
    ```
 
 4. Compare each proposed country code with `nordvpn-openvpn-countries.txt`. For any new entry, record at least one supporting dated observation, ideally tested on several NordVPN endpoints and both signed-in and signed-out sessions. Verify whether the observed IP is geolocated as intended.
-5. Edit **only** `region-lists.json` for the shortlist. Keep codes lowercase, unique and sorted. Do not hand-edit `country_names.json`, which is generated from `pycountry`.
+5. Edit **only** `region-lists.json` for the shortlist. Keep codes lowercase, unique and sorted. Do not hand-edit `country-names.json`, which is generated from `pycountry`.
 6. Update this document's rationale and review date, then update the fixed expected set in `tests/test_benchmark.py`. Run `python -m unittest discover -s tests -v`, `ruff check .` and `ruff format --check --diff .` before committing.
 7. Revisit the list when YouTube changes its monetised markets, NordVPN adds or removes locations, or credible repeatable tests contradict an entry. Remove locations that disappear from the current OpenVPN archive or become clearly unsuitable, documenting why.
 

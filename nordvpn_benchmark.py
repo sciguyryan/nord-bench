@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the ICMP reachability of endpoints described by OpenVPN profiles."""
+"""Benchmark NordVPN endpoints using ICMP or TCP connection timing."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
@@ -23,7 +24,7 @@ from urllib.request import urlopen
 import zipfile
 
 from nordvpn_filter import compile_filter, FilterSyntaxError, server_identity
-from nordvpn_regions import country_name, load_region_lists
+from nordvpn_regions import country_flag, country_name, load_region_lists
 
 ARCHIVE_URL = "https://downloads.nordcdn.com/configs/archives/servers/ovpn.zip"
 PRESETS = {"fast": (2, 6), "balanced": (3, 12), "thorough": (5, 25)}
@@ -55,6 +56,7 @@ class Measurement:
     samples: list[float] = field(default_factory=list)
     stage: str = "survey"
     error: str = ""
+    method: str = "icmp"
 
     @property
     def mean(self):
@@ -241,9 +243,41 @@ def ping(address: str, count: int, timeout: float) -> Measurement:
     return result
 
 
+def tcp_probe(address: str, port: int, count: int, timeout: float) -> Measurement:
+    """Time TCP handshakes to an advertised TCP OpenVPN port, without VPN login."""
+    result = Measurement(address=address, attempted=count, method="tcp")
+    for _ in range(count):
+        start = time.perf_counter()
+        try:
+            with socket.create_connection((address, port), timeout=timeout):
+                result.samples.append((time.perf_counter() - start) * 1000)
+        except OSError as exc:
+            result.error = f"TCP connection failed: {exc}"
+    if not result.samples and not result.error:
+        result.error = "no TCP connections succeeded"
+    return result
+
+
+def execute_tcp_stage(targets, count, timeout, workers, label, quiet):
+    """Probe unique (address, TCP port) targets concurrently."""
+    start = time.monotonic()
+    output = {}
+    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        tasks = {pool.submit(tcp_probe, address, port, count, timeout): (address, port) for address, port in targets}
+        for task in futures.as_completed(tasks):
+            target = tasks[task]
+            try:
+                output[target] = task.result()
+            except Exception as exc:
+                output[target] = Measurement(target[0], attempted=count, error=f"probe error: {exc}", method="tcp")
+            progress_line(label, len(output), len(targets), sum(bool(m.samples) for m in output.values()), start, quiet)
+    return output
+
+
 def rank(m: Measurement):
     # Reliability first. An unresponsive host is never described as offline.
     return (
+        not bool(m.samples),
         m.loss,
         m.median if m.median is not None else float("inf"),
         m.jitter if m.jitter is not None else float("inf"),
@@ -323,11 +357,18 @@ def terminal_colour_enabled(stream=None) -> bool:
     )
 
 
+def display_width(value: str) -> int:
+    """Measure visible table width, treating a flag pair as two terminal cells."""
+    visible = ANSI_ESCAPE.sub("", value)
+    # Regional indicator pairs form one flag glyph, generally two cells wide.
+    indicators = range(0x1F1E6, 0x1F200)
+    count = sum(1 for char in visible if ord(char) in indicators)
+    return len(visible) - count + (count // 2) * 2
+
+
 def render_table(headers, rows, ascii_only=False):
     rows = [[str(x) for x in row] for row in rows]
-    widths = [
-        max(len(str(header)), *(len(ANSI_ESCAPE.sub("", row[i])) for row in rows)) for i, header in enumerate(headers)
-    ]
+    widths = [max(len(str(header)), *(display_width(row[i]) for row in rows)) for i, header in enumerate(headers)]
     if ascii_only:
         corner, cross, vert, horiz = "+", "+", "|", "-"
     else:
@@ -338,7 +379,7 @@ def render_table(headers, rows, ascii_only=False):
         return (
             vert
             + vert.join(
-                " " + str(value) + " " * max(0, width - len(ANSI_ESCAPE.sub("", str(value)))) + " "
+                " " + str(value) + " " * max(0, width - display_width(str(value))) + " "
                 for value, width in zip(row, widths)
             )
             + vert
@@ -358,7 +399,11 @@ def render_table(headers, rows, ascii_only=False):
 def records_for(endpoints, measurements):
     records = []
     for endpoint in endpoints:
-        m = measurements[endpoint.host]
+        m = (
+            measurements[(endpoint.host, endpoint.port)]
+            if (endpoint.host, endpoint.port) in measurements
+            else measurements[endpoint.host]
+        )
         records.append(
             {
                 "server": endpoint.name,
@@ -367,6 +412,7 @@ def records_for(endpoints, measurements):
                 "address": endpoint.host,
                 "port": endpoint.port,
                 "protocol": endpoint.protocol,
+                "probe": m.method,
                 "stage": m.stage,
                 "sent": m.attempted,
                 "received": len(m.samples),
@@ -378,7 +424,17 @@ def records_for(endpoints, measurements):
                 "error": m.error,
             }
         )
-    ordered = sorted(records, key=lambda r: rank(measurements[r["address"]]) + (r["server"], r["protocol"], r["port"]))
+    ordered = sorted(
+        records,
+        key=lambda r: (
+            not bool(r["received"]),
+            r["loss_pct"],
+            r["median_ms"] if r["median_ms"] is not None else float("inf"),
+            r["server"],
+            r["protocol"],
+            r["port"],
+        ),
+    )
     # One displayed rank per canonical server and measured address. Keep all
     # configuration records separately for lossless CSV/JSON exports.
     return ordered
@@ -387,7 +443,15 @@ def records_for(endpoints, measurements):
 def distinct_servers(records):
     unique = {}
     for record in records:
-        unique.setdefault((record["server"], record["address"]), record)
+        unique.setdefault(
+            (
+                record["server"],
+                record["address"],
+                record["probe"],
+                record["port"] if record["probe"] == "tcp" else None,
+            ),
+            record,
+        )
     return list(unique.values())
 
 
@@ -405,15 +469,34 @@ def export(records, path, fmt, ascii_only):
 
 
 def format_results(records, top, ascii_only, *, colour=False, colourblind=False):
-    headers = ["#", "Server", "Country", "Transport", "IP", "Port", "Mean", "Median", "MAD", "Loss", "Samples", "Stage"]
+    headers = [
+        "#",
+        "Server",
+        "Country",
+        "Transport",
+        "Probe",
+        "IP",
+        "Port",
+        "Mean",
+        "Median",
+        "MAD",
+        "Loss",
+        "Samples",
+        "Stage",
+    ]
     rows = []
     for index, r in enumerate(records[:top], 1):
         rows.append(
             [
                 index,
                 r["server"],
-                r.get("country", "Unknown"),
+                (
+                    r.get("country", "Unknown")
+                    if ascii_only or not country_flag(r["server"])
+                    else f"{country_flag(r['server'])} {r.get('country', 'Unknown')}"
+                ),
                 r["protocol"],
+                r.get("probe", "icmp"),
                 r["address"],
                 r["port"],
                 colour_latency(
@@ -448,6 +531,12 @@ def main(argv=None):
     parser.add_argument("--region-list", action="append", default=[], metavar="NAME")
     parser.add_argument("--region-lists-file", type=Path, metavar="PATH")
     parser.add_argument("--list-region-lists", action="store_true")
+    parser.add_argument(
+        "--probe",
+        choices=("icmp", "tcp"),
+        default="icmp",
+        help="one consistent measurement method: ICMP ping or advertised TCP connection establishment",
+    )
     parser.add_argument("--accuracy", choices=tuple(PRESETS), default="balanced")
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--workers", type=int, default=24)
@@ -486,6 +575,8 @@ def main(argv=None):
         parser.error("--connect-rank must be between 1 and --top")
     if (args.connect_rank != 1 or args.replace_connection) and not args.auto_connect:
         parser.error("--connect-rank and --replace-connection require --auto-connect")
+    if args.probe == "tcp" and args.protocol == "udp" and not args.list_region_lists:
+        parser.error("--probe tcp requires --protocol tcp or --protocol both")
     try:
         region_lists = load_region_lists(args.region_lists_file)
         if args.list_region_lists:
@@ -504,7 +595,7 @@ def main(argv=None):
 
     if not benchmark_preflight(allow_active_vpn=args.allow_active_vpn):
         return 2
-    if shutil.which("ping") is None:
+    if args.probe == "icmp" and shutil.which("ping") is None:
         parser.error("system ping utility is required")
     try:
         with tempfile.TemporaryDirectory(prefix="nordvpn-benchmark-") as temp:
@@ -538,28 +629,62 @@ def main(argv=None):
                         print(f"Skipping {path}: {exc}", file=sys.stderr)
             if not endpoints:
                 parser.error("no matching valid OpenVPN endpoints found (check --protocol and --filter)")
-            # ICMP is IP-scoped, not OpenVPN-port-scoped. Hostnames are left as hostnames.
             addresses = sorted({e.host for e in endpoints})
             random.Random(0).shuffle(addresses)
             survey, additional = PRESETS[args.accuracy]
+            tcp_targets = sorted({(e.host, e.port) for e in endpoints if e.protocol == "tcp"})
+            if args.probe == "tcp" and not tcp_targets:
+                parser.error("no TCP OpenVPN endpoints matched; use --protocol tcp or both")
             if not args.quiet:
                 print(
                     f"Found {len(endpoints)} endpoints across {len(addresses)} addresses ({invalid} invalid profiles, {filtered} filtered endpoints)",
                     file=sys.stderr,
                 )
-            measurements = execute_stage(addresses, survey, args.timeout, args.workers, "Survey", args.quiet)
-            # Keep a broad shortlist, including borderline results. This remains a heuristic.
-            shortlist_size = min(len(addresses), max(args.top * 3, 20))
-            shortlist = sorted(addresses, key=lambda a: rank(measurements[a]))[:shortlist_size]
-            refined = execute_stage(shortlist, additional, args.timeout, args.workers, "Refinement", args.quiet)
-            for address, extra in refined.items():
-                initial = measurements[address]
-                initial.attempted += extra.attempted
-                initial.samples.extend(extra.samples)
-                initial.stage = "refined"
-                initial.error = "" if initial.samples else extra.error
-            records = records_for(endpoints, measurements)
+            measurements = {}
+            if args.probe == "icmp":
+                measurements = execute_stage(addresses, survey, args.timeout, args.workers, "ICMP survey", args.quiet)
+                shortlist_size = min(len(addresses), max(args.top * 3, 20))
+                shortlist = sorted(addresses, key=lambda a: rank(measurements[a]))[:shortlist_size]
+                refined = execute_stage(
+                    shortlist, additional, args.timeout, args.workers, "ICMP refinement", args.quiet
+                )
+                for address, extra in refined.items():
+                    initial = measurements[address]
+                    initial.attempted += extra.attempted
+                    initial.samples.extend(extra.samples)
+                    initial.stage = "refined"
+                    initial.error = "" if initial.samples else extra.error
+            if args.probe == "tcp":
+                targets = tcp_targets
+                if targets:
+                    tcp_results = execute_tcp_stage(
+                        targets, survey, args.timeout, args.workers, "TCP survey", args.quiet
+                    )
+                    shortlist_size = min(len(targets), max(args.top * 3, 20))
+                    shortlist = sorted(targets, key=lambda t: rank(tcp_results[t]))[:shortlist_size]
+                    refined = execute_tcp_stage(
+                        shortlist, additional, args.timeout, args.workers, "TCP refinement", args.quiet
+                    )
+                    for target, extra in refined.items():
+                        initial = tcp_results[target]
+                        initial.attempted += extra.attempted
+                        initial.samples.extend(extra.samples)
+                        initial.stage = "refined"
+                        initial.error = "" if initial.samples else extra.error
+                    measurements = tcp_results
+            # TCP records are port-scoped. ICMP results remain address-scoped.
+            if args.probe == "tcp":
+                measured_endpoints = [e for e in endpoints if e.protocol == "tcp"]
+            else:
+                measured_endpoints = endpoints
+            records = records_for(measured_endpoints, measurements)
+            assert len({record["probe"] for record in records}) <= 1, "mixed probe methods in one benchmark"
             ranked = distinct_servers(records)
+            if not any(row["received"] for row in ranked):
+                print(
+                    "Warning: no responsive endpoints; VPN availability remains unknown and no reliable fastest server can be identified.",
+                    file=sys.stderr,
+                )
             print(
                 format_results(
                     ranked,
@@ -574,6 +699,12 @@ def main(argv=None):
                 export(records if args.format in ("csv", "json") else ranked, destination, args.format, args.ascii)
                 if not args.quiet:
                     print(f"Wrote {len(records)} results to {destination}", file=sys.stderr)
+            if args.auto_connect and (args.connect_rank > len(ranked) or not ranked[args.connect_rank - 1]["received"]):
+                print(
+                    "Connection error: selected rank has no successful probe; cannot identify a fastest server.",
+                    file=sys.stderr,
+                )
+                return 2
             if args.auto_connect:
                 from nordvpn_connection import ConnectionError, connect
 

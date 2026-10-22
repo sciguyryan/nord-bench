@@ -26,13 +26,24 @@ def country_name(hostname: str) -> str:
     code = country_code(hostname)
     if code is None:
         return "Unknown"
-    names = json.loads((ROOT / "country_names.json").read_text(encoding="utf-8"))
+    names = json.loads((ROOT / "country-names.json").read_text(encoding="utf-8"))
     return names.get(code, "Unknown")
+
+
+def country_flag(hostname: str) -> str:
+    """Return a Unicode flag for a recognised ISO country, or an empty string."""
+    code = country_code(hostname)
+    if code is None:
+        return ""
+    names = json.loads((ROOT / "country-names.json").read_text(encoding="utf-8"))
+    if code not in names:
+        return ""
+    return "".join(chr(0x1F1E6 + ord(letter) - ord("a")) for letter in code)
 
 
 def load_region_lists(custom_file: Path | None = None) -> dict:
     """Custom definitions replace built-ins by name, never silently merge."""
-    names = json.loads((ROOT / "country_names.json").read_text(encoding="utf-8"))
+    names = json.loads((ROOT / "country-names.json").read_text(encoding="utf-8"))
     groups = json.loads((ROOT / "region-lists.json").read_text(encoding="utf-8"))
     if custom_file is not None:
         custom = json.loads(custom_file.expanduser().read_text(encoding="utf-8"))

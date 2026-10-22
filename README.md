@@ -138,7 +138,7 @@ The CI formatting check is deliberately read-only and fails if source files need
 
 ## Country names and named region lists
 
-The Country column is derived from NordVPN's server identifier. Country names come from the bundled `country_names.json` snapshot, generated from `pycountry`'s ISO 3166 data during development. The runtime does not need `pycountry` or a geolocation service. NordVPN's `uk` prefix is mapped to the United Kingdom; the prefix represents NordVPN's advertised location, not independent evidence of physical server placement.
+The Country column is derived from NordVPN's server identifier. Country names come from the bundled `country-names.json` snapshot, generated from `pycountry`'s ISO 3166 data during development. The runtime does not need `pycountry` or a geolocation service. NordVPN's `uk` prefix is mapped to the United Kingdom; the prefix represents NordVPN's advertised location, not independent evidence of physical server placement.
 
 The bundled `region-lists.json` provides an experimental `low-ads` group of 17 NordVPN OpenVPN country locations. The catalogue is manually curated against Google's published YouTube monetised-market list, independent reports and NordVPN-specific community observations. Each included code was also found in the NordVPN OpenVPN directory listing supplied for the October 2026 review. This is a shortlist of locations to *test*, not proof of advert-free playback, a general advertising classification or a guarantee. NordVPN server availability, IP geolocation and YouTube advertising behaviour can change.
 
@@ -184,3 +184,37 @@ The test jobs also report branch coverage, with an XML report uploaded from Pyth
 ## VPN connection preflight
 
 Before downloading profiles or probing servers, the benchmarker checks the NordVPN Linux CLI when available. If it confirms an active NordVPN connection, the run stops without disconnecting or replacing that connection. Disconnect manually using `nordvpn disconnect` before benchmarking to avoid measuring through the tunnel. Use `--allow-active-vpn` to deliberately continue through an active connection; a warning remains visible. If the NordVPN client is absent or its status cannot be read, the check reports uncertainty and continues. Other VPN clients and routes are not reliably detected by this check, so verify your network path separately. The preflight also applies when `--auto-connect` is requested; automatic connection occurs only after measurements finish.
+
+
+### Country flags in terminal results
+
+The Unicode terminal table prefixes recognised countries with their flag emoji (for example, `🇬🇧 United Kingdom`). Flags are derived from canonical ISO country codes, including NordVPN's `uk` to `gb` alias, and require no additional dependency. Unrecognised locations retain their text label without a flag. Use `--ascii` for a plain-text table without emoji; CSV and JSON exports continue to contain country names rather than presentation-only emoji. Flag appearance depends on the terminal's font and emoji support.
+
+
+## Probe methods
+
+The default `--probe icmp` retains the original ICMP benchmark. Some functioning VPN
+servers do not answer ICMP, so zero replies mean *ICMP unresponsive*, not offline.
+
+Use `--probe tcp --protocol tcp` to time TCP connection establishment to the
+port advertised in each TCP OpenVPN profile. A successful TCP handshake does not
+prove OpenVPN authentication or throughput. The result table includes a **Probe**
+column, and TCP measurements are port-specific. TCP mode requires matching TCP
+profiles; the default `--protocol udp` must be changed to `tcp` or `both`.
+
+Each benchmark run uses **exactly one** probe method. There is no automatic
+fallback or mixed-method ranking: TCP handshake times and ICMP round-trip times
+measure different operations and must not be compared as equivalent latency.
+With `--probe tcp --protocol both`, only the matching TCP profiles are benchmarked;
+UDP profiles are not silently assigned TCP results. Use `--protocol tcp` to make
+this selection explicit. The default `--protocol udp` is incompatible with
+`--probe tcp` and produces a clear argument error.
+
+```bash
+python nordvpn_benchmark.py --download --region-list low-ads --protocol tcp --probe tcp --top 20
+python nordvpn_benchmark.py --download --region-list low-ads --protocol udp --probe icmp --top 20
+```
+
+UDP `connect()` is not a network handshake. Protocol-aware UDP probing and
+optional authenticated tunnel validation remain future investigations. Automatic
+connection is refused if the selected rank has no successful probe.
