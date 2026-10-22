@@ -111,7 +111,52 @@ def parse_profile(path: Path) -> list[Endpoint]:
     return result
 
 
-def extract_archive(destination: Path, progress, protocol: str = "both") -> None:
+# Only infer a country from filenames following NordVPN's documented naming
+# convention. Unknown names must be parsed rather than silently excluded.
+PROFILE_COUNTRY = re.compile(
+    r"(?:\d+-)?([a-z]{2})\d+\.nordvpn\.com\.(?:udp|tcp)(?:_\d+(?:\.\d+)*)?\.ovpn",
+    re.I,
+)
+
+
+def profile_country(path: str) -> str | None:
+    from nordvpn_regions import normalise_country_code
+
+    match = PROFILE_COUNTRY.fullmatch(Path(path).name)
+    return normalise_country_code(match.group(1).lower()) if match else None
+
+
+def country_prefilter(expressions, region_lists):
+    """Return a conservative filename check for country-only restrictions.
+
+    Each CLI filter is ANDed. Expressions involving other fields are left for
+    full profile evaluation, including when mixed with country expressions.
+    """
+    country_only = []
+    for expression in expressions:
+        atoms = re.findall(r"[^\s!&|()]+", expression)
+        if atoms and all(
+            re.fullmatch(r"(?:country:)?[a-z]{2}", atom, re.I) or re.fullmatch(r"list:[a-z][a-z0-9_-]*", atom, re.I)
+            for atom in atoms
+        ):
+            country_only.append(compile_filter(expression, region_lists))
+
+    def eligible(path):
+        code = profile_country(str(path))
+        if code is None or not country_only:
+            return True
+        # A synthetic endpoint is safe here because selected predicates depend
+        # exclusively on its country identifier, not on profile contents.
+        from nordvpn_regions import COUNTRY_ALIASES
+
+        archive_code = next((alias for alias, canonical in COUNTRY_ALIASES.items() if canonical == code), code)
+        endpoint = Endpoint(str(path), "", 0, "", f"{archive_code}1.nordvpn.com")
+        return all(predicate(endpoint) for predicate in country_only)
+
+    return eligible
+
+
+def extract_archive(destination: Path, progress, protocol: str = "both", eligible=None) -> None:
     archive = destination / "nordvpn.zip"
     progress("Downloading OpenVPN configurations")
     with urlopen(ARCHIVE_URL, timeout=30) as response, archive.open("wb") as out:
@@ -140,7 +185,7 @@ def extract_archive(destination: Path, progress, protocol: str = "both") -> None
                 or re.search(rf"\.{protocol}(?:_\d+(?:\.\d+)*)?\.ovpn$", name) is not None
             )
 
-        entries = [info for info in all_profiles if matches(info)]
+        entries = [info for info in all_profiles if matches(info) and (eligible is None or eligible(info.filename))]
         if not entries:
             raise ValueError(f"no {protocol} OpenVPN configurations found in archive")
         total_bytes = sum(info.file_size for info in entries)
@@ -447,6 +492,7 @@ def main(argv=None):
                 parser.error(f"unknown region list: {name}")
         filters = [compile_filter(expression, region_lists) for expression in args.filter]
         filters.extend(compile_filter(f"list:{name}", region_lists) for name in args.region_list)
+        eligible = country_prefilter([*args.filter, *(f"list:{name}" for name in args.region_list)], region_lists)
     except (FilterSyntaxError, ValueError, OSError, json.JSONDecodeError) as exc:
         parser.error(f"invalid --filter: {exc}")
     if shutil.which("ping") is None:
@@ -455,7 +501,9 @@ def main(argv=None):
         with tempfile.TemporaryDirectory(prefix="nordvpn-benchmark-") as temp:
             root = Path(temp)
             if args.download:
-                extract_archive(root, lambda msg: None if args.quiet else print(msg, file=sys.stderr), args.protocol)
+                extract_archive(
+                    root, lambda msg: None if args.quiet else print(msg, file=sys.stderr), args.protocol, eligible
+                )
                 config_dir = root / "profiles"
             else:
                 config_dir = args.config_dir.expanduser()
@@ -465,6 +513,9 @@ def main(argv=None):
             invalid = 0
             filtered = 0
             for path in sorted(config_dir.rglob("*.ovpn")):
+                if not eligible(path):
+                    filtered += 1
+                    continue
                 try:
                     for endpoint in parse_profile(path):
                         if args.protocol == "both" or endpoint.protocol == args.protocol:

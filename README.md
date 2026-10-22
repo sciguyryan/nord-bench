@@ -166,3 +166,11 @@ The GitHub Actions workflow runs the unit tests, `ruff check .` and `ruff format
 NordVPN server hostnames are preserved exactly, but country matching uses canonical ISO 3166-1 alpha-2 codes. For example, NordVPN's `uk` prefix maps to `gb`. Both `--filter uk` and `--filter gb` match UK servers; `country:uk` and `country:gb` are equivalent. Named region lists accept either spelling and normalise entries when loaded. Duplicate aliases such as `uk` and `gb` in the same list are rejected.
 
 The country-name snapshot is generated, not hand-maintained. To update it, install the development-only dependency `pycountry==24.6.1` and run `python tools/generate_country_names.py`. CI checks the snapshot with `python tools/generate_country_names.py --check`. The runtime requires neither `pycountry` nor an internet connection for names. Provider-specific aliases remain deliberately explicit in `nordvpn_regions.py`. The curated `low-ads` list remains hand-maintained because ISO country data cannot establish advertising behaviour or NordVPN OpenVPN availability.
+
+## Early country filtering
+
+Country-only restrictions, including named region lists and Boolean expressions composed entirely of country and list selectors, are evaluated against recognised NordVPN configuration filenames before extraction and profile parsing. This reduces disk I/O and parsing work when a small subset of locations is selected. The full filter expression is still evaluated against parsed endpoints before DNS or ICMP measurements.
+
+Filters that depend on server, host, transport or port metadata are evaluated after parsing. Mixed expressions are not used to exclude profiles early, because doing so could change the result of an OR expression. Filenames that do not match NordVPN's recognised naming convention also fall back to normal parsing. Country aliases such as `uk` and `gb` remain equivalent.
+
+The OpenVPN ZIP is still downloaded in full; this optimisation does not reduce archive download bandwidth. It also does not change the ranking or export format.

@@ -248,3 +248,46 @@ class CountryAliasTests(unittest.TestCase):
             path.write_text(json.dumps({"british": {"description": "Duplicate", "countries": ["uk", "gb"]}}))
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 load_region_lists(path)
+
+
+class EarlyFilterTests(unittest.TestCase):
+    def test_country_boolean_semantics_and_unknown_fallback(self):
+        from nordvpn_regions import load_region_lists
+
+        regions = load_region_lists()
+        cases = {
+            "!(uk|us)": {"uk": False, "us": False, "nl": True},
+            "!uk|!us": {"uk": True, "us": True, "nl": True},
+            "list:low-ads|country:nl": {"ad": True, "nl": True, "us": False},
+            "country:gb": {"uk": True, "nl": False},
+        }
+        for expression, expected in cases.items():
+            eligible = b.country_prefilter([expression], regions)
+            for code, included in expected.items():
+                with self.subTest(expression=expression, code=code):
+                    self.assertEqual(eligible(f"{code}1.nordvpn.com.udp_2.6.ovpn"), included)
+            self.assertTrue(eligible("unusual-name.ovpn"))
+
+    def test_mixed_expression_never_excludes_on_filename_alone(self):
+        from nordvpn_regions import load_region_lists
+
+        eligible = b.country_prefilter(["country:uk|port:443"], load_region_lists())
+        self.assertTrue(eligible("us1.nordvpn.com.udp_2.6.ovpn"))
+
+    def test_archive_skips_excluded_profiles_before_extraction(self):
+        import io
+        import zipfile
+        from nordvpn_regions import load_region_lists
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with zipfile.ZipFile(root / "source.zip", "w") as archive:
+                for code in ("uk", "us", "ad"):
+                    archive.writestr(f"ovpn_udp/{code}1.nordvpn.com.udp_2.6.ovpn", "proto udp\nremote 127.0.0.1 53\n")
+            content = (root / "source.zip").read_bytes()
+            eligible = b.country_prefilter(["list:low-ads"], load_region_lists())
+            with patch.object(b, "urlopen", return_value=io.BytesIO(content)):
+                b.extract_archive(root, lambda message: None, "udp", eligible)
+            profiles = list((root / "profiles").glob("*.ovpn"))
+            self.assertEqual(len(profiles), 1)
+            self.assertIn("ad1.nordvpn.com", profiles[0].name)
