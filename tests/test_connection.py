@@ -47,6 +47,22 @@ class ConnectionTests(unittest.TestCase):
 
     @patch.object(c.sys, "platform", "linux")
     @patch.object(c.shutil, "which", return_value="/usr/bin/nordvpn")
+    def test_connected_without_identity_is_unverified_not_failed(self, _which):
+        import io
+
+        output = io.StringIO()
+        with patch.object(c, "run_client") as run:
+            run.side_effect = [
+                self.result("Status: Disconnected\n"),
+                self.result("Connection established"),
+                self.result("Status: Connected\n"),
+            ]
+            self.assertIsNone(c.connect(self.rows, 1, stream=output))
+        self.assertIn("Cannot verify", output.getvalue())
+        self.assertNotIn("Connected and verified", output.getvalue())
+
+    @patch.object(c.sys, "platform", "linux")
+    @patch.object(c.shutil, "which", return_value="/usr/bin/nordvpn")
     def test_unrecognised_status_fails_closed(self, _which):
         with (
             patch.object(c, "run_client", return_value=self.result("Something changed\n")),

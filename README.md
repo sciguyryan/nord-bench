@@ -218,3 +218,13 @@ python nordvpn_benchmark.py --download --region-list low-ads --protocol udp --pr
 UDP `connect()` is not a network handshake. Protocol-aware UDP probing and
 optional authenticated tunnel validation remain future investigations. Automatic
 connection is refused if the selected rank has no successful probe.
+
+### Console phase headings
+
+Interactive benchmark runs identify Configuration, Server discovery, Initial benchmarking, Refinement and Results as they execute. Headings and progress diagnostics are written to stderr, while the ranking table remains on stdout. Terminal headings use Unicode rules; `--ascii` and redirected diagnostics use plain ASCII without terminal control sequences. `--quiet` suppresses headings and progress, but not the requested results.
+
+## Console phase spacing and connection verification
+
+The diagnostic console separates completed phases with a single blank line. Phase headings and progress remain on standard error, while the results table remains on standard output. Quiet mode suppresses phase headings and their spacing.
+
+Automatic connection distinguishes a failed NordVPN command or disconnected status from a connected status without a reported server identity. When the CLI reports `Status: Connected` but omits `Current server`, the tool reports that the VPN connection is established but the requested server identity is **unverified**. It does not claim to have connected to the selected server, and it does not disconnect or retry automatically. A reported server identity that differs from the requested one remains a verification error.

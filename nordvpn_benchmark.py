@@ -509,6 +509,22 @@ def format_results(records, top, ascii_only, *, colour=False, colourblind=False)
     return render_table(headers, rows, ascii_only)
 
 
+def phase_header(title, *, ascii_only=False, quiet=False, separate=False, stream=None):
+    """Announce a real execution phase without interfering with data output."""
+    if quiet:
+        return
+    stream = sys.stderr if stream is None else stream
+    if separate:
+        print(file=stream, flush=True)
+    interactive = bool(getattr(stream, "isatty", lambda: False)())
+    if ascii_only or not interactive:
+        print(f"-- {title} --", file=stream, flush=True)
+        return
+    width = max(0, min(shutil.get_terminal_size(fallback=(80, 24)).columns, 100))
+    prefix = f"── {title} "
+    print(prefix + "─" * max(2, width - len(prefix)), file=stream, flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
@@ -592,8 +608,17 @@ def main(argv=None):
     if args.probe == "icmp" and shutil.which("ping") is None:
         parser.error("system ping utility is required")
     try:
+        phase_header("Configuration", ascii_only=args.ascii, quiet=args.quiet)
+        if not args.quiet:
+            print(
+                f"Probe method: {args.probe.upper()} | Accuracy: {args.accuracy} | Transport: {args.protocol}",
+                file=sys.stderr,
+            )
+            if args.region_list:
+                print(f"Region lists: {', '.join(args.region_list)}", file=sys.stderr)
         with tempfile.TemporaryDirectory(prefix="nordvpn-benchmark-") as temp:
             root = Path(temp)
+            phase_header("Server discovery", ascii_only=args.ascii, quiet=args.quiet, separate=True)
             if args.download:
                 extract_archive(
                     root, lambda msg: None if args.quiet else print(msg, file=sys.stderr), args.protocol, eligible
@@ -635,10 +660,12 @@ def main(argv=None):
                     file=sys.stderr,
                 )
             measurements = {}
+            phase_header("Initial benchmarking", ascii_only=args.ascii, quiet=args.quiet, separate=True)
             if args.probe == "icmp":
                 measurements = execute_stage(addresses, survey, args.timeout, args.workers, "ICMP survey", args.quiet)
                 shortlist_size = min(len(addresses), max(args.top * 3, 20))
                 shortlist = sorted(addresses, key=lambda a: rank(measurements[a]))[:shortlist_size]
+                phase_header("Refinement", ascii_only=args.ascii, quiet=args.quiet, separate=True)
                 refined = execute_stage(
                     shortlist, additional, args.timeout, args.workers, "ICMP refinement", args.quiet
                 )
@@ -656,6 +683,7 @@ def main(argv=None):
                     )
                     shortlist_size = min(len(targets), max(args.top * 3, 20))
                     shortlist = sorted(targets, key=lambda t: rank(tcp_results[t]))[:shortlist_size]
+                    phase_header("Refinement", ascii_only=args.ascii, quiet=args.quiet, separate=True)
                     refined = execute_tcp_stage(
                         shortlist, additional, args.timeout, args.workers, "TCP refinement", args.quiet
                     )
@@ -679,6 +707,7 @@ def main(argv=None):
                     "Warning: no responsive endpoints; VPN availability remains unknown and no reliable fastest server can be identified.",
                     file=sys.stderr,
                 )
+            phase_header("Results", ascii_only=args.ascii, quiet=args.quiet, separate=True)
             print(
                 format_results(
                     ranked,
@@ -700,6 +729,8 @@ def main(argv=None):
                 )
                 return 2
             if args.auto_connect:
+                if not args.quiet:
+                    print(file=sys.stderr)
                 from nordvpn_connection import ConnectionError, connect
 
                 def confirm(existing, selected):

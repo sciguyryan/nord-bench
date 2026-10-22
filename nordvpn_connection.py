@@ -76,7 +76,7 @@ def benchmark_preflight(*, allow_active_vpn: bool = False, stream=None) -> bool:
     return False
 
 
-def connect(records: list[dict], rank: int, *, replace_existing: bool = False, confirm=None, stream=None) -> str:
+def connect(records: list[dict], rank: int, *, replace_existing: bool = False, confirm=None, stream=None) -> str | None:
     """Connect to the selected rank and verify the actual NordVPN status.
 
     A ranked record is an OpenVPN profile, not necessarily a NordVPN CLI server.
@@ -92,7 +92,7 @@ def connect(records: list[dict], rank: int, *, replace_existing: bool = False, c
         raise ConnectionError(f"--connect-rank must be between 1 and {len(records)}")
     record = records[rank - 1]
     if not record.get("received", 0):
-        raise ConnectionError("selected server has no successful ICMP samples; refusing automatic connection")
+        raise ConnectionError("selected server has no successful probe samples; refusing automatic connection")
     filename = record["server"]
     # The canonical name is carried by NordVPN profile filenames even when the
     # remote directive is a numeric IP address.
@@ -119,7 +119,12 @@ def connect(records: list[dict], rank: int, *, replace_existing: bool = False, c
     if not actual.connected:
         raise ConnectionError("NordVPN reported success but its status is not connected")
     if not actual.server:
-        raise ConnectionError("NordVPN is connected, but did not report the server identity")
+        print(
+            f"Warning: NordVPN reports an established connection, but does not provide a server identity. "
+            f"Cannot verify that {hostname} was selected.",
+            file=stream,
+        )
+        return None
     if actual.server.lower() not in (hostname, server_id):
         raise ConnectionError(f"NordVPN connected to {actual.server}, not requested {hostname}")
     print(f"Connected and verified: {actual.server}", file=stream)
