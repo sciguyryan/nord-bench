@@ -228,3 +228,24 @@ Interactive benchmark runs identify Configuration, Server discovery, Initial ben
 The diagnostic console separates completed phases with a single blank line. Phase headings and progress remain on standard error, while the results table remains on standard output. Quiet mode suppresses phase headings and their spacing.
 
 Automatic connection distinguishes a failed NordVPN command or disconnected status from a connected status without a reported server identity. When the CLI reports `Status: Connected` but omits `Current server`, the tool reports that the VPN connection is established but the requested server identity is **unverified**. It does not claim to have connected to the selected server, and it does not disconnect or retry automatically. A reported server identity that differs from the requested one remains a verification error.
+
+## Derived endpoint cache
+
+`--download` now maintains a versioned JSON catalogue of parsed OpenVPN endpoints at
+`$XDG_CACHE_HOME/nord-bench/endpoints.json` (or `~/.cache/nord-bench/endpoints.json`).
+It caches the full endpoint inventory, independent of the selected region, transport or
+filter, but never caches latency measurements or VPN credentials. The first run still
+downloads and parses the complete archive. Later runs reuse the catalogue within the
+default 24-hour freshness interval. After that, the benchmarker attempts an HTTP
+conditional request when supported and otherwise downloads the archive and compares
+its SHA-256 digest. An unchanged digest avoids reparsing. The digest is a local change
+detector, not an independently authenticated checksum published by NordVPN.
+
+Use `--cache-ttl 6` to check for updates after six hours, `--refresh-cache` to
+force a remote check, `--offline` to use an existing validated catalogue without
+network access, `--no-cache` to retain the previous download-and-extract workflow,
+and `--cache-file PATH` to choose a different catalogue location. These options
+apply to `--download`; `--config-dir` continues reading local profiles directly.
+Updates are written atomically after parsing and validation. A failed update does
+not overwrite an existing valid catalogue. Offline mode refuses missing or invalid
+caches instead of silently downloading anything.

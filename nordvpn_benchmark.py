@@ -530,6 +530,13 @@ def main(argv=None):
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--config-dir", type=Path)
     source.add_argument("--download", action="store_true")
+    parser.add_argument("--cache-file", type=Path, help="derived endpoint JSON cache location")
+    parser.add_argument(
+        "--cache-ttl", type=float, default=24, metavar="HOURS", help="cache freshness interval in hours (default: 24)"
+    )
+    parser.add_argument("--refresh-cache", action="store_true", help="force a remote archive check")
+    parser.add_argument("--no-cache", action="store_true", help="download and parse without a persistent cache")
+    parser.add_argument("--offline", action="store_true", help="use only a previously validated endpoint cache")
     parser.add_argument("--protocol", choices=("udp", "tcp", "both"), default="udp")
     parser.add_argument(
         "--filter",
@@ -579,6 +586,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.list_region_lists and not (args.download or args.config_dir):
         parser.error("one of --download or --config-dir is required")
+    if args.cache_ttl < 0 or not math.isfinite(args.cache_ttl):
+        parser.error("--cache-ttl must be a finite non-negative number of hours")
+    if args.offline and (not args.download or args.no_cache or args.refresh_cache):
+        parser.error("--offline requires --download and cannot be combined with --no-cache or --refresh-cache")
     if args.top < 1 or not 1 <= args.workers <= 128 or not 0.1 <= args.timeout <= 30:
         parser.error("--top must be positive, --workers 1..128, --timeout 0.1..30")
     if args.connect_rank < 1 or (args.auto_connect and args.connect_rank > args.top):
@@ -619,33 +630,56 @@ def main(argv=None):
         with tempfile.TemporaryDirectory(prefix="nordvpn-benchmark-") as temp:
             root = Path(temp)
             phase_header("Server discovery", ascii_only=args.ascii, quiet=args.quiet, separate=True)
-            if args.download:
-                extract_archive(
-                    root, lambda msg: None if args.quiet else print(msg, file=sys.stderr), args.protocol, eligible
-                )
-                config_dir = root / "profiles"
-            else:
-                config_dir = args.config_dir.expanduser()
-                if not config_dir.is_dir():
-                    parser.error(f"configuration directory does not exist: {config_dir}")
             endpoints = []
             invalid = 0
             filtered = 0
-            for path in sorted(config_dir.rglob("*.ovpn")):
-                if not eligible(path):
-                    filtered += 1
-                    continue
-                try:
-                    for endpoint in parse_profile(path):
-                        if args.protocol == "both" or endpoint.protocol == args.protocol:
-                            if all(predicate(endpoint) for predicate in filters):
-                                endpoints.append(endpoint)
-                            else:
-                                filtered += 1
-                except (ValueError, UnicodeError, OSError) as exc:
-                    invalid += 1
-                    if args.verbose:
-                        print(f"Skipping {path}: {exc}", file=sys.stderr)
+            if args.download and not args.no_cache:
+                from nordvpn_cache import default_path, refresh
+
+                cache_path = (args.cache_file or default_path()).expanduser()
+                catalogue = refresh(
+                    cache_path,
+                    ARCHIVE_URL,
+                    args.cache_ttl * 3600,
+                    lambda msg: None if args.quiet else print(msg, file=sys.stderr),
+                    force=args.refresh_cache,
+                    offline=args.offline,
+                )
+                for entry in catalogue:
+                    endpoint = Endpoint(**entry)
+                    if not eligible(endpoint.file):
+                        filtered += 1
+                    elif (args.protocol == "both" or endpoint.protocol == args.protocol) and all(
+                        predicate(endpoint) for predicate in filters
+                    ):
+                        endpoints.append(endpoint)
+                    else:
+                        filtered += 1
+            else:
+                if args.download:
+                    extract_archive(
+                        root, lambda msg: None if args.quiet else print(msg, file=sys.stderr), args.protocol, eligible
+                    )
+                    config_dir = root / "profiles"
+                else:
+                    config_dir = args.config_dir.expanduser()
+                    if not config_dir.is_dir():
+                        parser.error(f"configuration directory does not exist: {config_dir}")
+                for path in sorted(config_dir.rglob("*.ovpn")):
+                    if not eligible(path):
+                        filtered += 1
+                        continue
+                    try:
+                        for endpoint in parse_profile(path):
+                            if args.protocol == "both" or endpoint.protocol == args.protocol:
+                                if all(predicate(endpoint) for predicate in filters):
+                                    endpoints.append(endpoint)
+                                else:
+                                    filtered += 1
+                    except (ValueError, UnicodeError, OSError) as exc:
+                        invalid += 1
+                        if args.verbose:
+                            print(f"Skipping {path}: {exc}", file=sys.stderr)
             if not endpoints:
                 parser.error("no matching valid OpenVPN endpoints found (check --protocol and --filter)")
             addresses = sorted({e.host for e in endpoints})
