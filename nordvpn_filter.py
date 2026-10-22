@@ -6,6 +6,8 @@ import fnmatch
 import re
 from pathlib import Path
 
+from nordvpn_regions import normalise_country_code
+
 
 class FilterSyntaxError(ValueError):
     """An invalid filter expression, including its source position."""
@@ -67,6 +69,8 @@ def compile_filter(expression: str, region_lists: dict | None = None):
             fail("unknown region list", pos)
         if field == "country" and not re.fullmatch(r"[a-z]{2}", pattern):
             fail("country must be a two-letter code", pos)
+        if field == "country":
+            pattern = normalise_country_code(pattern)
         if field == "protocol" and pattern not in ("udp", "tcp"):
             fail("protocol must be udp or tcp", pos)
         if field == "port" and (not pattern.isascii() or not pattern.isdecimal() or not 1 <= int(pattern) <= 65535):
@@ -78,7 +82,7 @@ def compile_filter(expression: str, region_lists: dict | None = None):
             hostname = endpoint.name.lower()
             match = re.fullmatch(r"([a-z]{2}\d+)\.nordvpn\.com", hostname)
             server = match.group(1) if match else ""
-            country = server[:2] if server else ""
+            country = normalise_country_code(server[:2]) if server else ""
             if field == "list":
                 return country in region_lists[pattern]["countries"]
             value = {

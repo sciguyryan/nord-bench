@@ -160,3 +160,9 @@ The terminal table displays one rank per canonical hostname and destination IP, 
 ## Development checks
 
 The GitHub Actions workflow runs the unit tests, `ruff check .` and `ruff format --check --diff .`, with Ruff pinned to version 0.14.2. Run the same commands locally before committing; the entry-point script must retain its executable bit in Git.
+
+### Country-code aliases and ISO data
+
+NordVPN server hostnames are preserved exactly, but country matching uses canonical ISO 3166-1 alpha-2 codes. For example, NordVPN's `uk` prefix maps to `gb`. Both `--filter uk` and `--filter gb` match UK servers; `country:uk` and `country:gb` are equivalent. Named region lists accept either spelling and normalise entries when loaded. Duplicate aliases such as `uk` and `gb` in the same list are rejected.
+
+The country-name snapshot is generated, not hand-maintained. To update it, install the development-only dependency `pycountry==24.6.1` and run `python tools/generate_country_names.py`. CI checks the snapshot with `python tools/generate_country_names.py --check`. The runtime requires neither `pycountry` nor an internet connection for names. Provider-specific aliases remain deliberately explicit in `nordvpn_regions.py`. The curated `low-ads` list remains hand-maintained because ISO country data cannot establish advertising behaviour or NordVPN OpenVPN availability.

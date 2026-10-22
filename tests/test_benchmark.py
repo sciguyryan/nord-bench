@@ -212,3 +212,39 @@ class CuratedLowAdsTests(unittest.TestCase):
         netherlands = b.Endpoint("nl1.ovpn", "192.0.2.2", 53, "udp", "nl1.nordvpn.com")
         self.assertTrue(matcher(andorra))
         self.assertFalse(matcher(netherlands))
+
+
+class CountryAliasTests(unittest.TestCase):
+    def test_nordvpn_hostname_retains_provider_identity(self):
+        from nordvpn_regions import country_code, country_name, normalise_country_code
+
+        self.assertEqual(country_code("uk2108.nordvpn.com"), "gb")
+        self.assertEqual(country_name("uk2108.nordvpn.com"), "United Kingdom")
+        self.assertEqual(normalise_country_code("UK"), "gb")
+        self.assertEqual(normalise_country_code("nl"), "nl")
+        self.assertEqual(b.server_identity("uk2108.nordvpn.com.udp_2.6.ovpn"), "uk2108.nordvpn.com")
+
+    def test_aliases_work_in_boolean_filters(self):
+        from nordvpn_filter import compile_filter
+
+        endpoint = b.Endpoint("uk2108.ovpn", "192.0.2.1", 53, "udp", "uk2108.nordvpn.com")
+        for expression in ("uk", "gb", "country:uk", "country:gb", "uk|nl", "gb&!us"):
+            with self.subTest(expression=expression):
+                self.assertTrue(compile_filter(expression)(endpoint))
+        self.assertFalse(compile_filter("!(gb|us)")(endpoint))
+
+    def test_region_list_normalises_aliases_and_rejects_duplicates(self):
+        import json
+        from nordvpn_filter import compile_filter
+        from nordvpn_regions import load_region_lists
+
+        endpoint = b.Endpoint("uk2108.ovpn", "192.0.2.1", 53, "udp", "uk2108.nordvpn.com")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "regions.json"
+            path.write_text(json.dumps({"british": {"description": "UK servers", "countries": ["uk"]}}))
+            lists = load_region_lists(path)
+            self.assertEqual(lists["british"]["countries"], ["gb"])
+            self.assertTrue(compile_filter("list:british", lists)(endpoint))
+            path.write_text(json.dumps({"british": {"description": "Duplicate", "countries": ["uk", "gb"]}}))
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                load_region_lists(path)

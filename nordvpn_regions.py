@@ -7,10 +7,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+# NordVPN uses a few provider-specific identifiers rather than ISO alpha-2 codes.
+COUNTRY_ALIASES = {"uk": "gb"}
+
+
+def normalise_country_code(code: str) -> str:
+    """Convert a provider country identifier to its ISO alpha-2 equivalent."""
+    code = code.lower()
+    return COUNTRY_ALIASES.get(code, code)
+
 
 def country_code(hostname: str) -> str | None:
     match = re.fullmatch(r"([a-z]{2})[0-9]+\.nordvpn\.com", hostname, re.I)
-    return match.group(1).lower() if match else None
+    return normalise_country_code(match.group(1)) if match else None
 
 
 def country_name(hostname: str) -> str:
@@ -40,8 +49,13 @@ def load_region_lists(custom_file: Path | None = None) -> dict:
         ):
             raise ValueError(f"invalid region list definition: {name!r}")
         codes = item["countries"]
-        if any(not isinstance(code, str) or code.lower() not in names or code != code.lower() for code in codes):
+        if any(
+            not isinstance(code, str) or code != code.lower() or normalise_country_code(code) not in names
+            for code in codes
+        ):
             raise ValueError(f"invalid country code in region list: {name!r}")
-        if len(codes) != len(set(codes)):
+        canonical = [normalise_country_code(code) for code in codes]
+        if len(canonical) != len(set(canonical)):
             raise ValueError(f"duplicate country code in region list: {name!r}")
+        item["countries"] = canonical
     return groups
