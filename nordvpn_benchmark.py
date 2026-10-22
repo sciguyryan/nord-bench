@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from urllib.request import urlopen
 import zipfile
 
@@ -636,6 +637,7 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=24)
     parser.add_argument("--timeout", type=float, default=1.0)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--report", type=Path, help="write a versioned JSON report with benchmark settings and results")
     parser.add_argument("--format", choices=("csv", "json", "table"), default="csv")
     parser.add_argument("--ascii", action="store_true")
     parser.add_argument(
@@ -671,6 +673,8 @@ def main(argv=None):
         parser.error("--top must be positive, --workers 1..128, --timeout 0.1..30")
     if args.connect_rank < 1 or (args.auto_connect and args.connect_rank > args.top):
         parser.error("--connect-rank must be between 1 and --top")
+    if args.report and args.output and args.report.expanduser().resolve() == args.output.expanduser().resolve():
+        parser.error("--report and --output must use different paths")
     if (args.connect_rank != 1 or args.replace_connection) and not args.auto_connect:
         parser.error("--connect-rank and --replace-connection require --auto-connect")
     if args.probe == "tcp" and args.protocol == "udp" and not args.list_region_lists:
@@ -695,6 +699,7 @@ def main(argv=None):
         return 2
     if args.probe == "icmp" and shutil.which("ping") is None:
         parser.error("system ping utility is required")
+    started_at = datetime.now(timezone.utc).isoformat()
     try:
         phase_header("Configuration", ascii_only=args.ascii, quiet=args.quiet)
         if not args.quiet:
@@ -708,6 +713,7 @@ def main(argv=None):
             root = Path(temp)
             phase_header("Server discovery", ascii_only=args.ascii, quiet=args.quiet, separate=True)
             endpoints = []
+            catalogue_source = None
             invalid = 0
             filtered = 0
             if args.download and not args.no_cache:
@@ -722,6 +728,9 @@ def main(argv=None):
                     force=args.refresh_cache,
                     offline=args.offline,
                 )
+                from nordvpn_cache import load
+
+                catalogue_source = dict(load(cache_path, ARCHIVE_URL)["source"])
                 for entry in catalogue:
                     endpoint = Endpoint(**entry)
                     if not eligible(endpoint.file):
@@ -834,6 +843,60 @@ def main(argv=None):
                 export(records if args.format in ("csv", "json") else ranked, destination, args.format, args.ascii)
                 if not args.quiet:
                     print(f"Wrote {len(records)} results to {destination}", file=sys.stderr)
+            if args.report:
+                from nordvpn_report import SCHEMA_VERSION, write_report
+
+                report = {
+                    "schema_version": SCHEMA_VERSION,
+                    "started_at": started_at,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "methodology": {
+                        "probe": args.probe,
+                        "ranking": "responsive first, then loss, median, MAD and deterministic identity tie-breaks",
+                        "survey_samples_per_target": survey,
+                        "refinement_additional_samples_per_target": additional,
+                        "refinement": "one representative TCP port per server/address"
+                        if args.probe == "tcp"
+                        else "address shortlist",
+                        "stability": "deterministic exploratory 90% bootstrap median intervals"
+                        if args.stability
+                        else None,
+                    },
+                    "settings": {
+                        "source": "download" if args.download else "local",
+                        "protocol": args.protocol,
+                        "accuracy": args.accuracy,
+                        "top": args.top,
+                        "workers": args.workers,
+                        "timeout_seconds": args.timeout,
+                        "filters": args.filter,
+                        "region_lists": args.region_list,
+                    },
+                    "source": {
+                        "archive_url": ARCHIVE_URL if args.download else None,
+                        "archive_sha256": catalogue_source["sha256"] if catalogue_source else None,
+                        "cache_checked_at": catalogue_source["checked_at"] if catalogue_source else None,
+                        "note": "Archive digest unavailable when persistent catalogue is bypassed"
+                        if args.download and not catalogue_source
+                        else None,
+                    },
+                    "counts": {
+                        "eligible_endpoints": len(endpoints),
+                        "measured_endpoints": len(records),
+                        "distinct_servers": len(ranked),
+                        "invalid_profiles": invalid,
+                        "filtered_endpoints": filtered,
+                    },
+                    "rankings": ranked,
+                    "measurements": records,
+                    "stability_diagnostics": stability_report(ranked, measurements, top=args.top)
+                    if args.stability
+                    else None,
+                }
+                destination = args.report.expanduser()
+                write_report(destination, report)
+                if not args.quiet:
+                    print(f"Wrote benchmark report to {destination}", file=sys.stderr)
             if args.auto_connect and (args.connect_rank > len(ranked) or not ranked[args.connect_rank - 1]["received"]):
                 print(
                     "Connection error: selected rank has no successful probe; cannot identify a fastest server.",

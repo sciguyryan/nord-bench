@@ -241,3 +241,13 @@ The report indicates whether a candidate's interval overlaps the ranked leader's
 ### NordVPN status identity recognition
 
 For automatic connection verification, the Linux CLI status parser recognises the English `Current server:`, `Hostname:` and `Server hostname:` fields. Values must be canonical NordVPN server hostnames (for example `uk715.nordvpn.com`) or exact short server identifiers (`uk715`). It does not infer an identity from the country, city, endpoint IP address or connection-success message. Missing identity remains unverified, while conflicting or malformed identity fields cause verification to fail closed. NordVPN CLI output can change between versions; live compatibility should be checked against the installed client.
+
+### Reproducible benchmark reports
+
+Use `--report benchmark-report.json` to write a separate versioned JSON report alongside the normal terminal results and optional `--output` export. The report records UTC start and completion timestamps, selected benchmark settings, probe and sampling methodology, catalogue provenance where available, endpoint counts, distinct-server rankings and all per-endpoint measurements including unsuccessful probes and individual latency samples. The report is written atomically with restrictive file permissions, and `--report` must not point to the same file as `--output`.
+
+```bash
+python nordvpn_benchmark.py --download --protocol tcp --probe tcp --region-list low-ads --stability --report benchmark-report.json
+```
+
+The report schema starts at version 1. The archive SHA-256 is available when the persistent derived endpoint cache is used; local profiles and `--no-cache` downloads currently have no recorded archive digest, and the report explicitly represents that absence as `null`. Reports preserve the measurements and their methodology, but network latency is inherently variable, so identical settings cannot guarantee identical future results. Existing CSV and JSON export contracts remain unchanged. Reports contain endpoint IP addresses and server identities; treat them as operational data and review them before sharing.
