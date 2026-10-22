@@ -251,3 +251,11 @@ python nordvpn_benchmark.py --download --protocol tcp --probe tcp --region-list 
 ```
 
 The report schema starts at version 1. The archive SHA-256 is available when the persistent derived endpoint cache is used; local profiles and `--no-cache` downloads currently have no recorded archive digest, and the report explicitly represents that absence as `null`. Reports preserve the measurements and their methodology, but network latency is inherently variable, so identical settings cannot guarantee identical future results. Existing CSV and JSON export contracts remain unchanged. Reports contain endpoint IP addresses and server identities; treat them as operational data and review them before sharing.
+
+### Preview automatic connection
+
+Use `--auto-connect --dry-run` to benchmark normally and display the selected rank and proposed `nordvpn connect` command without changing the VPN connection. The preview checks the current NordVPN CLI status where available, reports an existing connection and whether `--replace-connection` would authorise its replacement, and never executes a connection command. It does not bypass the normal active-VPN benchmarking preflight: use `--allow-active-vpn` explicitly if benchmarking over an existing NordVPN connection is intentional. A dry run cannot verify the identity of a future connection, and the VPN state may change after the preview. `--dry-run` requires `--auto-connect`.
+
+```bash
+python nordvpn_benchmark.py --download --protocol tcp --probe tcp --auto-connect --dry-run --top 10
+```
