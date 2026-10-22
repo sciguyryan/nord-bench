@@ -255,3 +255,13 @@ apply to `--download`; `--config-dir` continues reading local profiles directly.
 Updates are written atomically after parsing and validation. A failed update does
 not overwrite an existing valid catalogue. Offline mode refuses missing or invalid
 caches instead of silently downloading anything.
+
+## Exploratory ranking stability
+
+Use `--stability` to display an additional advisory assessment of the ranked servers without changing their order or the CSV/JSON export schema. The assessment computes deterministic 90% percentile-bootstrap intervals for the sample median of each displayed responsive endpoint. It requires at least eight successful timing samples per endpoint; otherwise the interval is marked unavailable. The calculation uses the actual samples collected during the run and does not generate additional network traffic.
+
+```bash
+python nordvpn_benchmark.py --download --protocol tcp --probe tcp --stability --top 20
+```
+
+The report indicates whether a candidate's interval overlaps the ranked leader's interval. Overlap does not establish equivalent performance, and non-overlap is not a formal pairwise significance test. Bootstrap intervals assume sufficiently independent, stable samples, which sequential network measurements may violate. Results are exploratory and should not be interpreted as probabilities that a server is fastest, or as evidence of actual VPN throughput. The existing loss-first, median-based ranking and auto-connect selection remain unchanged.

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as futures
 import csv
+import hashlib
 import json
 import math
 import os
@@ -470,6 +471,58 @@ def distinct_servers(records):
     return list(unique.values())
 
 
+def median_interval(samples, identity, *, resamples=400):
+    """Deterministic percentile bootstrap interval for a sample median.
+
+    This describes sampling uncertainty under an independent, stationary sample
+    assumption; it is not a guarantee about future network performance.
+    """
+    if len(samples) < 8:
+        return None
+    seed = int.from_bytes(hashlib.sha256(identity.encode("utf-8")).digest()[:8], "big")
+    generator = random.Random(seed)
+    count = len(samples)
+    estimates = sorted(statistics.median(generator.choices(samples, k=count)) for _ in range(resamples))
+    return (estimates[int(resamples * 0.05)], estimates[int(resamples * 0.95) - 1])
+
+
+def stability_report(ranked, measurements, *, top=10):
+    """Provide an advisory comparison without modifying the benchmark ranking."""
+    candidates = [row for row in ranked if row["received"]][:top]
+    if not candidates:
+        return "No responsive servers available for stability assessment."
+    entries = []
+    for row in candidates:
+        key = (row["address"], row["port"]) if row["probe"] == "tcp" else row["address"]
+        measurement = measurements[key]
+        identity = f"{row['server']}|{row['address']}|{row['port']}|{row['probe']}"
+        interval = median_interval(measurement.samples, identity)
+        entries.append((row, interval))
+    leader = entries[0][1]
+    lines = ["Exploratory 90% bootstrap median intervals (milliseconds):"]
+    for row, interval in entries:
+        if interval is None:
+            assessment = "insufficient samples (minimum 8)"
+            bounds = "n/a"
+        else:
+            bounds = f"{interval[0]:.2f} to {interval[1]:.2f}"
+            if leader is None:
+                assessment = "no refined leader interval"
+            elif row is entries[0][0]:
+                assessment = "ranked leader"
+            elif interval[0] <= leader[1] and leader[0] <= interval[1]:
+                assessment = "overlaps leader interval"
+            else:
+                assessment = "non-overlapping intervals"
+        lines.append(f"  {row['server']} ({row['address']}:{row['port']}): {bounds}; {assessment}")
+    lines.append(
+        "Advisory only: overlapping intervals do not establish equivalence, and "
+        "non-overlap is not a formal pairwise significance test. "
+        "Sequential network samples may be correlated."
+    )
+    return "\n".join(lines)
+
+
 def export(records, path, fmt, ascii_only):
     if fmt == "json":
         path.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
@@ -577,6 +630,9 @@ def main(argv=None):
     )
     parser.add_argument("--accuracy", choices=tuple(PRESETS), default="balanced")
     parser.add_argument("--top", type=int, default=10)
+    parser.add_argument(
+        "--stability", action="store_true", help="show exploratory bootstrap median intervals for ranked servers"
+    )
     parser.add_argument("--workers", type=int, default=24)
     parser.add_argument("--timeout", type=float, default=1.0)
     parser.add_argument("--output", type=Path)
@@ -771,6 +827,8 @@ def main(argv=None):
                     colourblind=args.colourblind,
                 )
             )
+            if args.stability:
+                print("\n" + stability_report(ranked, measurements, top=args.top))
             if args.output:
                 destination = args.output.expanduser()
                 export(records if args.format in ("csv", "json") else ranked, destination, args.format, args.ascii)
