@@ -127,7 +127,7 @@ The benchmarker checks for `nordvpn`, reads its connection status, and derives a
 
 After issuing `nordvpn connect SERVER`, the script checks `nordvpn status` and requires the reported server to match the requested server. A failed connection returns a non-zero exit status without discarding an export already written. The client must already be installed, configured and logged in. No credentials are handled by this script, and it does not change NordVPN's configured VPN technology. Consequently, the resulting VPN transport may differ from the OpenVPN profile used for ICMP discovery. The client may also refuse a server identifier that is no longer available.
 
-The status parser currently recognises English `Status:` and `Current server:` output. Other client versions and localisations need testing; an unrecognised response causes the connection operation to stop rather than guessing. Actual client integration has not yet been verified on a live NordVPN session.
+The status parser recognises English `Status:`, `Current server:`, `Hostname:` and `Server hostname:` output. Other client versions and localisations need testing; an unrecognised response causes the connection operation to stop rather than guessing. Actual client integration has not yet been verified on a live NordVPN session.
 
 ## Continuous integration and formatting
 
@@ -199,31 +199,18 @@ The Unicode terminal table prefixes recognised countries with their flag emoji (
 
 ## Probe methods
 
-The default `--probe icmp` retains the original ICMP benchmark. Some functioning VPN
-servers do not answer ICMP, so zero replies mean *ICMP unresponsive*, not offline.
+The default `--probe icmp` retains the original ICMP benchmark. Some functioning VPN servers do not answer ICMP, so zero replies mean *ICMP unresponsive*, not offline.
 
-Use `--probe tcp --protocol tcp` to time TCP connection establishment to the
-port advertised in each TCP OpenVPN profile. A successful TCP handshake does not
-prove OpenVPN authentication or throughput. The result table includes a **Probe**
-column, and TCP measurements are port-specific. TCP mode requires matching TCP
-profiles; the default `--protocol udp` must be changed to `tcp` or `both`.
+Use `--probe tcp --protocol tcp` to time TCP connection establishment to the port advertised in each TCP OpenVPN profile. A successful TCP handshake does not prove OpenVPN authentication or throughput. The result table includes a **Probe** column, and TCP measurements are port-specific. TCP mode requires matching TCP profiles; the default `--protocol udp` must be changed to `tcp` or `both`.
 
-Each benchmark run uses **exactly one** probe method. There is no automatic
-fallback or mixed-method ranking: TCP handshake times and ICMP round-trip times
-measure different operations and must not be compared as equivalent latency.
-With `--probe tcp --protocol both`, only the matching TCP profiles are benchmarked;
-UDP profiles are not silently assigned TCP results. Use `--protocol tcp` to make
-this selection explicit. The default `--protocol udp` is incompatible with
-`--probe tcp` and produces a clear argument error.
+Each benchmark run uses **exactly one** probe method. There is no automatic fallback or mixed-method ranking: TCP handshake times and ICMP round-trip times measure different operations and must not be compared as equivalent latency. With `--probe tcp --protocol both`, only the matching TCP profiles are benchmarked; UDP profiles are not silently assigned TCP results. Use `--protocol tcp` to make this selection explicit. The default `--protocol udp` is incompatible with `--probe tcp` and produces a clear argument error.
 
 ```bash
 python nordvpn_benchmark.py --download --region-list low-ads --protocol tcp --probe tcp --top 20
 python nordvpn_benchmark.py --download --region-list low-ads --protocol udp --probe icmp --top 20
 ```
 
-UDP `connect()` is not a network handshake. Protocol-aware UDP probing and
-optional authenticated tunnel validation remain future investigations. Automatic
-connection is refused if the selected rank has no successful probe.
+UDP `connect()` is not a network handshake. Protocol-aware UDP probing and optional authenticated tunnel validation remain future investigations. Automatic connection is refused if the selected rank has no successful probe.
 
 ### Console phase headings
 
@@ -237,24 +224,9 @@ Automatic connection distinguishes a failed NordVPN command or disconnected stat
 
 ## Derived endpoint cache
 
-`--download` now maintains a versioned JSON catalogue of parsed OpenVPN endpoints at
-`$XDG_CACHE_HOME/nord-bench/endpoints.json` (or `~/.cache/nord-bench/endpoints.json`).
-It caches the full endpoint inventory, independent of the selected region, transport or
-filter, but never caches latency measurements or VPN credentials. The first run still
-downloads and parses the complete archive. Later runs reuse the catalogue within the
-default 24-hour freshness interval. After that, the benchmarker attempts an HTTP
-conditional request when supported and otherwise downloads the archive and compares
-its SHA-256 digest. An unchanged digest avoids reparsing. The digest is a local change
-detector, not an independently authenticated checksum published by NordVPN.
+`--download` now maintains a versioned JSON catalogue of parsed OpenVPN endpoints at `$XDG_CACHE_HOME/nord-bench/endpoints.json` (or `~/.cache/nord-bench/endpoints.json`). It caches the full endpoint inventory, independent of the selected region, transport or filter, but never caches latency measurements or VPN credentials. The first run still downloads and parses the complete archive. Later runs reuse the catalogue within the default 24-hour freshness interval. After that, the benchmarker attempts an HTTP conditional request when supported and otherwise downloads the archive and compares its SHA-256 digest. An unchanged digest avoids reparsing. The digest is a local change detector, not an independently authenticated checksum published by NordVPN.
 
-Use `--cache-ttl 6` to check for updates after six hours, `--refresh-cache` to
-force a remote check, `--offline` to use an existing validated catalogue without
-network access, `--no-cache` to retain the previous download-and-extract workflow,
-and `--cache-file PATH` to choose a different catalogue location. These options
-apply to `--download`; `--config-dir` continues reading local profiles directly.
-Updates are written atomically after parsing and validation. A failed update does
-not overwrite an existing valid catalogue. Offline mode refuses missing or invalid
-caches instead of silently downloading anything.
+Use `--cache-ttl 6` to check for updates after six hours, `--refresh-cache` to force a remote check, `--offline` to use an existing validated catalogue without network access, `--no-cache` to retain the previous download-and-extract workflow, and `--cache-file PATH` to choose a different catalogue location. These options apply to `--download`; `--config-dir` continues reading local profiles directly. Updates are written atomically after parsing and validation. A failed update does not overwrite an existing valid catalogue. Offline mode refuses missing or invalid caches instead of silently downloading anything.
 
 ## Exploratory ranking stability
 
@@ -265,3 +237,7 @@ python nordvpn_benchmark.py --download --protocol tcp --probe tcp --stability --
 ```
 
 The report indicates whether a candidate's interval overlaps the ranked leader's interval. Overlap does not establish equivalent performance, and non-overlap is not a formal pairwise significance test. Bootstrap intervals assume sufficiently independent, stable samples, which sequential network measurements may violate. Results are exploratory and should not be interpreted as probabilities that a server is fastest, or as evidence of actual VPN throughput. The existing loss-first, median-based ranking and auto-connect selection remain unchanged.
+
+### NordVPN status identity recognition
+
+For automatic connection verification, the Linux CLI status parser recognises the English `Current server:`, `Hostname:` and `Server hostname:` fields. Values must be canonical NordVPN server hostnames (for example `uk715.nordvpn.com`) or exact short server identifiers (`uk715`). It does not infer an identity from the country, city, endpoint IP address or connection-success message. Missing identity remains unverified, while conflicting or malformed identity fields cause verification to fail closed. NordVPN CLI output can change between versions; live compatibility should be checked against the installed client.

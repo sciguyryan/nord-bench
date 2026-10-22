@@ -34,17 +34,41 @@ def run_client(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess
         raise ConnectionError(f"cannot execute nordvpn: {exc}") from exc
 
 
+def normalise_server_identity(value: str) -> str | None:
+    """Accept only exact NordVPN server IDs or canonical hostnames."""
+    candidate = value.strip().lower().rstrip(".")
+    if SERVER_ID.fullmatch(candidate):
+        return candidate
+    if re.fullmatch(r"[a-z]{2}[0-9]+", candidate, re.I):
+        return f"{candidate}.nordvpn.com"
+    return None
+
+
+def parse_status(raw: str) -> ConnectionState:
+    """Parse recognised English status fields without inferring an identity."""
+    states = re.findall(r"^\s*Status:\s*(Connected|Disconnected)\s*$", raw, re.I | re.M)
+    if len(states) != 1:
+        raise ConnectionError("NordVPN status format is not recognised; refusing to change the connection")
+    connected = states[0].lower() == "connected"
+    # Some CLI versions use Hostname rather than Current server. Never use
+    # Country, City, IP or generic descriptive labels as identity evidence.
+    values = re.findall(r"^\s*(?:Current server|Hostname|Server hostname):\s*(.*?)\s*$", raw, re.I | re.M)
+    identities = {normalise_server_identity(value) for value in values}
+    identities.discard(None)
+    if len(identities) > 1:
+        raise ConnectionError("NordVPN status contains conflicting server identities")
+    # A present but unrecognised field is not evidence of an exact server.
+    if values and any(normalise_server_identity(value) is None for value in values):
+        raise ConnectionError("NordVPN status contains an unrecognised server identity")
+    server = next(iter(identities), None) if connected else None
+    return ConnectionState(connected, server, raw)
+
+
 def status() -> ConnectionState:
     result = run_client("status")
     if result.returncode:
         raise ConnectionError(f"cannot read NordVPN status: {(result.stderr or result.stdout).strip()}")
-    raw = result.stdout
-    match = re.search(r"^Status:\s*(Connected|Disconnected)\s*$", raw, re.I | re.M)
-    if not match:
-        raise ConnectionError("NordVPN status format is not recognised; refusing to change the connection")
-    connected = match.group(1).lower() == "connected"
-    server_match = re.search(r"^Current server:\s*(\S+)\s*$", raw, re.I | re.M)
-    return ConnectionState(connected, server_match.group(1).lower() if server_match else None, raw)
+    return parse_status(result.stdout)
 
 
 def benchmark_preflight(*, allow_active_vpn: bool = False, stream=None) -> bool:
@@ -103,7 +127,7 @@ def connect(records: list[dict], rank: int, *, replace_existing: bool = False, c
     server_id = match.group("id").lower()
     current = status()
     if current.connected:
-        if current.server and current.server.lower() in (hostname, server_id):
+        if current.server == hostname:
             print(f"Already connected to {hostname}; no change required.", file=stream)
             return hostname
         if not replace_existing:
@@ -125,7 +149,7 @@ def connect(records: list[dict], rank: int, *, replace_existing: bool = False, c
             file=stream,
         )
         return None
-    if actual.server.lower() not in (hostname, server_id):
+    if actual.server != hostname:
         raise ConnectionError(f"NordVPN connected to {actual.server}, not requested {hostname}")
     print(f"Connected and verified: {actual.server}", file=stream)
     return actual.server

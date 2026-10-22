@@ -87,3 +87,26 @@ class ConnectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatusIdentityTests(unittest.TestCase):
+    def test_hostname_field(self):
+        self.assertEqual(c.parse_status("Status: Connected\nHostname: uk715.nordvpn.com\n").server, "uk715.nordvpn.com")
+
+    def test_short_server_id(self):
+        self.assertEqual(c.parse_status("Status: Connected\nCurrent server: UK715\n").server, "uk715.nordvpn.com")
+
+    def test_unknown_identity_remains_unverified(self):
+        self.assertIsNone(c.parse_status("Status: Connected\nCountry: United Kingdom\n").server)
+
+    def test_conflicting_identity_rejected(self):
+        with self.assertRaisesRegex(c.ConnectionError, "conflicting"):
+            c.parse_status("Status: Connected\nHostname: uk715.nordvpn.com\nCurrent server: de123.nordvpn.com\n")
+
+    def test_invalid_identity_rejected(self):
+        with self.assertRaisesRegex(c.ConnectionError, "unrecognised server identity"):
+            c.parse_status("Status: Connected\nHostname: vpn.example.com\n")
+
+    def test_duplicate_status_rejected(self):
+        with self.assertRaisesRegex(c.ConnectionError, "not recognised"):
+            c.parse_status("Status: Connected\nStatus: Disconnected\n")
