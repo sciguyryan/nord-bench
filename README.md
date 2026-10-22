@@ -174,3 +174,9 @@ Country-only restrictions, including named region lists and Boolean expressions 
 Filters that depend on server, host, transport or port metadata are evaluated after parsing. Mixed expressions are not used to exclude profiles early, because doing so could change the result of an OR expression. Filenames that do not match NordVPN's recognised naming convention also fall back to normal parsing. Country aliases such as `uk` and `gb` remain equivalent.
 
 The OpenVPN ZIP is still downloaded in full; this optimisation does not reduce archive download bandwidth. It also does not change the ranking or export format.
+
+## Test strategy
+
+The GitHub Actions workflow runs Ruff linting, Ruff formatting and generated ISO country-data verification as a separate quality job. An independent offline test matrix runs on Python 3.11, 3.12 and 3.13 on every push and pull request. The tests use synthetic OpenVPN profiles, in-memory ZIP archives and mocked ICMP/client calls; they do not need NordVPN credentials, real network access or a working VPN connection.
+
+The test jobs also report branch coverage, with an XML report uploaded from Python 3.13. Coverage is diagnostic rather than a release threshold at present. Run the suite locally using `python -m unittest discover -s tests -v`. Live NordVPN downloads and real VPN connection tests are intentionally excluded from routine CI.
