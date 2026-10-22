@@ -47,6 +47,35 @@ def status() -> ConnectionState:
     return ConnectionState(connected, server_match.group(1).lower() if server_match else None, raw)
 
 
+def benchmark_preflight(*, allow_active_vpn: bool = False, stream=None) -> bool:
+    """Check NordVPN CLI status without changing any network connections.
+
+    Return False only when a confirmed connection blocks benchmarking. Missing
+    clients and unreadable status are reported as uncertain, not disconnected.
+    """
+    stream = stream or sys.stderr
+    if sys.platform != "linux" or shutil.which("nordvpn") is None:
+        print("Preflight: NordVPN connection status unavailable; other VPNs may affect results.", file=stream)
+        return True
+    try:
+        current = status()
+    except ConnectionError as exc:
+        print(
+            f"Preflight: cannot establish NordVPN connection status ({exc}). Results may be affected by a VPN.",
+            file=stream,
+        )
+        return True
+    if not current.connected:
+        return True
+    server = current.server or "unknown server"
+    print(f"Preflight: NordVPN is connected ({server}). Benchmark measurements may be distorted.", file=stream)
+    if allow_active_vpn:
+        print("Continuing with --allow-active-vpn; measurements reflect the current network path.", file=stream)
+        return True
+    print("Disconnect using `nordvpn disconnect`, then rerun; or explicitly use --allow-active-vpn.", file=stream)
+    return False
+
+
 def connect(records: list[dict], rank: int, *, replace_existing: bool = False, confirm=None, stream=None) -> str:
     """Connect to the selected rank and verify the actual NordVPN status.
 

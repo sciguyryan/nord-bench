@@ -462,6 +462,11 @@ def main(argv=None):
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
+        "--allow-active-vpn",
+        action="store_true",
+        help="permit benchmarking while NordVPN is connected (results may be distorted)",
+    )
+    parser.add_argument(
         "--auto-connect", action="store_true", help="connect to the selected ranked server using the NordVPN Linux CLI"
     )
     parser.add_argument(
@@ -495,6 +500,10 @@ def main(argv=None):
         eligible = country_prefilter([*args.filter, *(f"list:{name}" for name in args.region_list)], region_lists)
     except (FilterSyntaxError, ValueError, OSError, json.JSONDecodeError) as exc:
         parser.error(f"invalid --filter: {exc}")
+    from nordvpn_connection import benchmark_preflight
+
+    if not benchmark_preflight(allow_active_vpn=args.allow_active_vpn):
+        return 2
     if shutil.which("ping") is None:
         parser.error("system ping utility is required")
     try:
