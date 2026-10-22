@@ -271,6 +271,8 @@ def execute_tcp_stage(targets, count, timeout, workers, label, quiet):
             except Exception as exc:
                 output[target] = Measurement(target[0], attempted=count, error=f"probe error: {exc}", method="tcp")
             progress_line(label, len(output), len(targets), sum(bool(m.samples) for m in output.values()), start, quiet)
+    if sys.stderr.isatty() and not quiet:
+        print(file=sys.stderr)
     return output
 
 
@@ -443,15 +445,7 @@ def records_for(endpoints, measurements):
 def distinct_servers(records):
     unique = {}
     for record in records:
-        unique.setdefault(
-            (
-                record["server"],
-                record["address"],
-                record["probe"],
-                record["port"] if record["probe"] == "tcp" else None,
-            ),
-            record,
-        )
+        unique.setdefault((record["server"], record["address"]), record)
     return list(unique.values())
 
 
@@ -493,7 +487,7 @@ def format_results(records, top, ascii_only, *, colour=False, colourblind=False)
                 (
                     r.get("country", "Unknown")
                     if ascii_only or not country_flag(r["server"])
-                    else f"{country_flag(r['server'])} {r.get('country', 'Unknown')}"
+                    else f"{country_flag(r['server'])}  {r.get('country', 'Unknown')}"
                 ),
                 r["protocol"],
                 r.get("probe", "icmp"),

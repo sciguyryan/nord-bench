@@ -347,9 +347,9 @@ class CountryFlagTests(unittest.TestCase):
         }
         unicode_table = b.format_results([record], 1, False)
         ascii_table = b.format_results([record], 1, True)
-        self.assertIn("🇬🇧 United Kingdom", unicode_table)
+        self.assertIn("🇬🇧  United Kingdom", unicode_table)
         self.assertNotIn("🇬🇧", ascii_table)
         self.assertIn("United Kingdom", ascii_table)
-        self.assertEqual(b.display_width("🇬🇧 United Kingdom"), len("   United Kingdom"))
+        self.assertEqual(b.display_width("🇬🇧  United Kingdom"), len("    United Kingdom"))
         # All rows retain the same number of separators.
         self.assertEqual(len({line.count("│") for line in unicode_table.splitlines() if "│" in line}), 1)

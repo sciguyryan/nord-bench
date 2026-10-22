@@ -43,8 +43,22 @@ class TCPProbeTests(unittest.TestCase):
         endpoints = [b.Endpoint("test.ovpn", "192.0.2.1", port, "tcp", "nl1.nordvpn.com") for port in (443, 1194)]
         measurements = {(e.host, e.port): b.Measurement(e.host, 1, [10.0], method="tcp") for e in endpoints}
         records = b.records_for(endpoints, measurements)
-        self.assertEqual(len(b.distinct_servers(records)), 2)
+        self.assertEqual(len(b.distinct_servers(records)), 1)
+        self.assertEqual(len(records), 2)  # Per-port export detail is preserved.
         self.assertIn("Probe", b.format_results(records, 2, True))
+
+    def test_tcp_progress_ends_with_newline(self):
+        import io
+        from unittest.mock import patch
+
+        output = io.StringIO()
+        with (
+            patch.object(b.sys, "stderr", output),
+            patch.object(output, "isatty", return_value=True),
+            patch.object(b, "tcp_probe", return_value=b.Measurement("192.0.2.1", 1, [1.0], method="tcp")),
+        ):
+            b.execute_tcp_stage([("192.0.2.1", 443)], 1, 0.5, 1, "TCP refinement", False)
+        self.assertTrue(output.getvalue().endswith("\n"))
 
     def test_icmp_and_tcp_not_interchangeable(self):
         endpoints = [
