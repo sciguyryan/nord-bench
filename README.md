@@ -87,6 +87,12 @@ The terminal table includes mean and median ICMP latency. Mean values use a cont
 
 Colours are presentation only. Ranking still uses packet loss, median latency and MAD, and the numeric values remain visible without colour. ANSI true-colour sequences are emitted only when stdout is an interactive terminal that supports conventional terminal controls; `NO_COLOR`, `TERM=dumb`, `--no-colour` and `--no-color` disable them. `--ascii` affects table borders independently. Exported files never contain ANSI colour sequences. Some terminals may render true colour differently or not at all.
 
+## TCP refinement fairness
+
+TCP surveying retains measurements for each distinct address and advertised port, but refinement now selects at most one representative port for each canonical server/address pair. The representative is the best survey result for that server, with deterministic port selection when survey measurements tie. The refinement shortlist therefore contains distinct servers rather than multiple ports for the same server, reducing unnecessary repeat connections and preventing heavily represented servers from consuming disproportionate refinement capacity.
+
+This is a **refinement-only** reduction: the initial TCP survey still probes all eligible address/port pairs to choose the representative. CSV and JSON exports continue to include survey measurements for every eligible port, with additional refinement samples only on the selected representatives. A port's relative performance can vary over time, so the chosen representative is not guaranteed to remain the fastest port. ICMP sampling and the single-probe-method contract are unchanged.
+
 ## Progress and output
 
 During each stage, stderr shows completed addresses, responding addresses, elapsed time and an approximate ETA. Interactive terminals refresh a single status line; redirected output receives periodic status lines. Standard output contains the final table. `--quiet` suppresses routine progress, not the final table.

@@ -442,6 +442,27 @@ def records_for(endpoints, measurements):
     return ordered
 
 
+def tcp_refinement_shortlist(endpoints, survey_results, top):
+    """Choose one surveyed TCP port per distinct server/address for refinement.
+
+    Survey results remain port-scoped for exports. Stable tie-breaking ensures
+    that archive ordering and thread completion order do not affect selection.
+    """
+    representatives = {}
+    for endpoint in endpoints:
+        if endpoint.protocol != "tcp":
+            continue
+        target = (endpoint.host, endpoint.port)
+        identity = (endpoint.name, endpoint.host)
+        candidate = (rank(survey_results[target]), endpoint.port, target)
+        previous = representatives.get(identity)
+        if previous is None or candidate < previous:
+            representatives[identity] = candidate
+    limit = min(len(representatives), max(top * 3, 20))
+    ordered = sorted(representatives.items(), key=lambda item: (item[1][0], item[0], item[1][1]))
+    return [candidate[2] for _, candidate in ordered[:limit]]
+
+
 def distinct_servers(records):
     unique = {}
     for record in records:
@@ -715,8 +736,7 @@ def main(argv=None):
                     tcp_results = execute_tcp_stage(
                         targets, survey, args.timeout, args.workers, "TCP survey", args.quiet
                     )
-                    shortlist_size = min(len(targets), max(args.top * 3, 20))
-                    shortlist = sorted(targets, key=lambda t: rank(tcp_results[t]))[:shortlist_size]
+                    shortlist = tcp_refinement_shortlist(endpoints, tcp_results, args.top)
                     phase_header("Refinement", ascii_only=args.ascii, quiet=args.quiet, separate=True)
                     refined = execute_tcp_stage(
                         shortlist, additional, args.timeout, args.workers, "TCP refinement", args.quiet
