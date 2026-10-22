@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""Benchmark the ICMP reachability of endpoints described by OpenVPN profiles."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as futures
+import csv
+import json
+import math
+import os
+from pathlib import Path
+import random
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from urllib.request import urlopen
+import zipfile
+
+from nordvpn_filter import compile_filter, FilterSyntaxError, server_identity
+
+ARCHIVE_URL = "https://downloads.nordcdn.com/configs/archives/servers/ovpn.zip"
+PRESETS = {"fast": (2, 6), "balanced": (3, 12), "thorough": (5, 25)}
+MAX_ARCHIVE_BYTES = 150 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024
+MAX_FILES = 50000
+MAX_PROFILE_BYTES = 2 * 1024 * 1024
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+# Fixed latency anchors avoid making a uniformly slow server fleet appear green.
+LATENCY_ANCHORS = (0.0, 20.0, 40.0, 65.0, 100.0, 150.0, 250.0)
+DEFAULT_PALETTE = ("#20b65a", "#59c54a", "#a0c83b", "#d4bb38", "#e89b35", "#e46a34", "#d63b38")
+COLOURBLIND_PALETTE = ("#0072b2", "#268cb9", "#56b4e9", "#a5b5ba", "#e6a25a", "#d98238", "#d55e00")
+PING_TIME = re.compile(r"\btime\s*[=<]\s*(\d+(?:[.,]\d+)?)\s*ms\b", re.I)
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    file: str
+    host: str
+    port: int
+    protocol: str
+    name: str
+
+
+@dataclass
+class Measurement:
+    address: str
+    attempted: int = 0
+    samples: list[float] = field(default_factory=list)
+    stage: str = "survey"
+    error: str = ""
+
+    @property
+    def mean(self):
+        return statistics.mean(self.samples) if self.samples else None
+
+    @property
+    def median(self):
+        return statistics.median(self.samples) if self.samples else None
+
+    @property
+    def jitter(self):
+        return statistics.median(abs(x - self.median) for x in self.samples) if self.samples else None
+
+    @property
+    def loss(self):
+        return (self.attempted - len(self.samples)) / self.attempted * 100 if self.attempted else 100.0
+
+
+def parse_profile(path: Path) -> list[Endpoint]:
+    """Read only OpenVPN directives; embedded certificate/key bodies are ignored."""
+    proto = "udp"
+    remotes = []
+    in_block = False
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if line.startswith("<") and not line.startswith("</"):
+            in_block = True
+            continue
+        if line.startswith("</"):
+            in_block = False
+            continue
+        if in_block or not line or line.startswith(("#", ";")):
+            continue
+        parts = line.split()
+        if parts[0] == "proto" and len(parts) > 1:
+            proto = parts[1].lower()
+        if parts[0] == "remote" and len(parts) >= 2:
+            port = int(parts[2]) if len(parts) > 2 else 1194
+            if not 1 <= port <= 65535:
+                raise ValueError("invalid remote port")
+            remotes.append((parts[1], port, parts[3].lower() if len(parts) > 3 else None))
+    result = []
+    for host, port, override in remotes:
+        transport = override or proto
+        if transport.startswith("udp"):
+            transport = "udp"
+        elif transport.startswith("tcp"):
+            transport = "tcp"
+        else:
+            raise ValueError(f"unsupported transport: {transport}")
+        result.append(Endpoint(str(path), host, port, transport, server_identity(path.name)))
+    if not result:
+        raise ValueError("no remote directive")
+    return result
+
+
+def extract_archive(destination: Path, progress, protocol: str = "both") -> None:
+    archive = destination / "nordvpn.zip"
+    progress("Downloading OpenVPN configurations")
+    with urlopen(ARCHIVE_URL, timeout=30) as response, archive.open("wb") as out:
+        total = 0
+        while chunk := response.read(1024 * 1024):
+            total += len(chunk)
+            if total > MAX_ARCHIVE_BYTES:
+                raise ValueError("download exceeds archive size limit")
+            out.write(chunk)
+            progress(f"Downloaded {total / 1048576:.1f} MiB")
+    progress("Inspecting and extracting OpenVPN configurations")
+    with zipfile.ZipFile(archive) as z:
+        # NordVPN's archive separates transport variants by filename/directory.
+        # Filter before applying extraction budgets: the unused TCP collection
+        # should not prevent a UDP-only benchmark (or vice versa).
+        all_profiles = [x for x in z.infolist() if x.filename.lower().endswith(".ovpn") and not x.is_dir()]
+
+        def matches(info):
+            if protocol == "both":
+                return True
+            name = info.filename.lower()
+            # Names commonly end in .udp.ovpn or .udp_2.6.ovpn; archives
+            # may also organise profiles beneath ovpn_udp/ovpn_tcp/.
+            return (
+                f"/{'ovpn_' + protocol}/" in "/" + name
+                or re.search(rf"\.{protocol}(?:_\d+(?:\.\d+)*)?\.ovpn$", name) is not None
+            )
+
+        entries = [info for info in all_profiles if matches(info)]
+        if not entries:
+            raise ValueError(f"no {protocol} OpenVPN configurations found in archive")
+        total_bytes = sum(info.file_size for info in entries)
+        if len(entries) > MAX_FILES:
+            raise ValueError(f"archive contains {len(entries)} selected profiles; safety limit is {MAX_FILES}")
+        if total_bytes > MAX_EXTRACTED_BYTES:
+            raise ValueError(
+                f"selected profiles total {total_bytes / 1048576:.1f} MiB; safety limit is {MAX_EXTRACTED_BYTES / 1048576:.0f} MiB"
+            )
+        if any(info.file_size > MAX_PROFILE_BYTES for info in entries):
+            raise ValueError(f"archive contains a profile larger than {MAX_PROFILE_BYTES / 1048576:.0f} MiB")
+        progress(f"Selected {len(entries)} {protocol} profiles ({total_bytes / 1048576:.1f} MiB uncompressed)")
+        for index, info in enumerate(entries, 1):
+            # Flatten paths into numbered files: no archive-controlled output paths.
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError("archive contains a symbolic link")
+            target = destination / "profiles" / f"{index:05d}-{Path(info.filename).name}"
+            target.parent.mkdir(exist_ok=True)
+            with z.open(info) as source, target.open("wb") as output:
+                remaining = info.file_size
+                while block := source.read(min(65536, remaining + 1)):
+                    remaining -= len(block)
+                    if remaining < 0:
+                        raise ValueError("archive entry exceeds declared size")
+                    output.write(block)
+            if index % 250 == 0:
+                progress(f"Extracted {index}/{len(entries)} configurations")
+    archive.unlink()
+    progress(f"Extracted {len(entries)} configurations")
+
+
+def ping(address: str, count: int, timeout: float) -> Measurement:
+    """Use the system ping utility, capturing individual reply times and loss."""
+    result = Measurement(address=address, attempted=count)
+    if os.name == "nt":
+        cmd = ["ping", "-n", str(count), "-w", str(max(1, int(timeout * 1000))), address]
+    elif sys.platform == "darwin":
+        cmd = ["ping", "-n", "-c", str(count), "-W", str(max(1, int(timeout * 1000))), address]
+    else:
+        cmd = ["ping", "-n", "-c", str(count), "-W", str(max(1, math.ceil(timeout))), "-i", "0.2", address]
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, errors="replace", timeout=count * (timeout + 1.0) + 3, check=False
+        )
+        result.samples = [float(value.replace(",", ".")) for value in PING_TIME.findall(completed.stdout)]
+        result.samples = result.samples[:count]
+        if not result.samples:
+            result.error = "no ICMP replies"
+    except subprocess.TimeoutExpired:
+        result.error = "ping timed out"
+    except OSError as exc:
+        result.error = f"ping unavailable: {exc.strerror or exc}"
+    return result
+
+
+def rank(m: Measurement):
+    # Reliability first. An unresponsive host is never described as offline.
+    return (
+        m.loss,
+        m.median if m.median is not None else float("inf"),
+        m.jitter if m.jitter is not None else float("inf"),
+        m.address,
+    )
+
+
+def progress_line(stage, completed, total, successes, start, quiet=False):
+    if quiet:
+        return
+    elapsed = time.monotonic() - start
+    eta = (elapsed / completed * (total - completed)) if completed else None
+    eta_text = f"{eta:.0f}s" if eta is not None else "?"
+    message = f"{stage}: {completed}/{total} | responding {successes} | elapsed {elapsed:.1f}s | ETA {eta_text}"
+    if sys.stderr.isatty():
+        print("\r" + message.ljust(100), end="", file=sys.stderr, flush=True)
+    else:
+        print(message, file=sys.stderr, flush=True)
+
+
+def execute_stage(addresses, count, timeout, workers, label, quiet):
+    start = time.monotonic()
+    output = {}
+    last = 0.0
+    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        tasks = {pool.submit(ping, addr, count, timeout): addr for addr in addresses}
+        for task in futures.as_completed(tasks):
+            addr = tasks[task]
+            try:
+                output[addr] = task.result()
+            except Exception as exc:
+                output[addr] = Measurement(addr, attempted=count, error=f"probe error: {exc}")
+            now = time.monotonic()
+            if now - last >= 0.25 or len(output) == len(addresses):
+                progress_line(
+                    label, len(output), len(addresses), sum(bool(m.samples) for m in output.values()), start, quiet
+                )
+                last = now
+    if sys.stderr.isatty() and not quiet:
+        print(file=sys.stderr)
+    return output
+
+
+def latency_rgb(milliseconds: float, colourblind: bool = False) -> tuple[int, int, int]:
+    """Interpolate between fixed latency anchors, clamping outlying values."""
+    palette = COLOURBLIND_PALETTE if colourblind else DEFAULT_PALETTE
+    value = max(0.0, milliseconds)
+    for index in range(len(LATENCY_ANCHORS) - 1):
+        left, right = LATENCY_ANCHORS[index : index + 2]
+        if value <= right:
+            fraction = (value - left) / (right - left)
+            a, b = palette[index : index + 2]
+            return tuple(
+                round(int(a[offset : offset + 2], 16) * (1 - fraction) + int(b[offset : offset + 2], 16) * fraction)
+                for offset in (1, 3, 5)
+            )
+    last = palette[-1]
+    return tuple(int(last[offset : offset + 2], 16) for offset in (1, 3, 5))
+
+
+def colour_latency(value: str, milliseconds: float | None, *, enabled: bool, colourblind: bool = False) -> str:
+    """Apply terminal colour only to a numeric mean; retain the value as text."""
+    if not enabled or milliseconds is None or not math.isfinite(milliseconds):
+        return value
+    r, g, b = latency_rgb(milliseconds, colourblind)
+    return f"\x1b[38;2;{r};{g};{b}m{value}\x1b[0m"
+
+
+def terminal_colour_enabled(stream=None) -> bool:
+    """Respect conventional no-colour settings and avoid escape codes in pipes."""
+    if stream is None:
+        stream = sys.stdout
+    return bool(
+        getattr(stream, "isatty", lambda: False)()
+        and os.environ.get("NO_COLOR") is None
+        and os.environ.get("TERM", "") != "dumb"
+    )
+
+
+def render_table(headers, rows, ascii_only=False):
+    rows = [[str(x) for x in row] for row in rows]
+    widths = [
+        max(len(str(header)), *(len(ANSI_ESCAPE.sub("", row[i])) for row in rows)) for i, header in enumerate(headers)
+    ]
+    if ascii_only:
+        corner, cross, vert, horiz = "+", "+", "|", "-"
+    else:
+        corner, cross, vert, horiz = "┼", "┼", "│", "─"
+    sep = cross.join(horiz * (width + 2) for width in widths)
+
+    def line(row):
+        return (
+            vert
+            + vert.join(
+                " " + str(value) + " " * max(0, width - len(ANSI_ESCAPE.sub("", str(value)))) + " "
+                for value, width in zip(row, widths)
+            )
+            + vert
+        )
+
+    return "\n".join(
+        [
+            ("+" if ascii_only else "┌") + sep.replace("┼", "┬") + ("+" if ascii_only else "┐"),
+            line(headers),
+            corner + sep + corner,
+            *(line(row) for row in rows),
+            ("+" if ascii_only else "└") + sep.replace("┼", "┴") + ("+" if ascii_only else "┘"),
+        ]
+    )
+
+
+def records_for(endpoints, measurements):
+    records = []
+    for endpoint in endpoints:
+        m = measurements[endpoint.host]
+        records.append(
+            {
+                "server": endpoint.name,
+                "config_file": Path(endpoint.file).name,
+                "address": endpoint.host,
+                "port": endpoint.port,
+                "protocol": endpoint.protocol,
+                "stage": m.stage,
+                "sent": m.attempted,
+                "received": len(m.samples),
+                "loss_pct": round(m.loss, 2),
+                "median_ms": round(m.median, 3) if m.median is not None else None,
+                "mean_ms": round(m.mean, 3) if m.mean is not None else None,
+                "jitter_mad_ms": round(m.jitter, 3) if m.jitter is not None else None,
+                "samples_ms": m.samples,
+                "error": m.error,
+            }
+        )
+    return sorted(records, key=lambda r: rank(measurements[r["address"]]) + (r["protocol"], r["port"], r["server"]))
+
+
+def export(records, path, fmt, ascii_only):
+    if fmt == "json":
+        path.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
+    elif fmt == "csv":
+        with path.open("w", newline="", encoding="utf-8") as stream:
+            fields = [key for key in records[0] if key != "samples_ms"]
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows({key: row[key] for key in fields} for row in records)
+    else:
+        path.write_text(format_results(records, len(records), ascii_only, colour=False) + "\n", encoding="utf-8")
+
+
+def format_results(records, top, ascii_only, *, colour=False, colourblind=False):
+    headers = ["#", "Server", "Transport", "IP", "Port", "Mean", "Median", "MAD", "Loss", "Samples", "Stage"]
+    rows = []
+    for index, r in enumerate(records[:top], 1):
+        rows.append(
+            [
+                index,
+                r["server"],
+                r["protocol"],
+                r["address"],
+                r["port"],
+                colour_latency(
+                    f"{r['mean_ms']:.2f} ms" if r["mean_ms"] is not None else "—",
+                    r["mean_ms"],
+                    enabled=colour,
+                    colourblind=colourblind,
+                ),
+                f"{r['median_ms']:.2f} ms" if r["median_ms"] is not None else "—",
+                f"{r['jitter_mad_ms']:.2f} ms" if r["jitter_mad_ms"] is not None else "—",
+                f"{r['loss_pct']:.1f}%",
+                f"{r['received']}/{r['sent']}",
+                r["stage"],
+            ]
+        )
+    return render_table(headers, rows, ascii_only)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--config-dir", type=Path)
+    source.add_argument("--download", action="store_true")
+    parser.add_argument("--protocol", choices=("udp", "tcp", "both"), default="udp")
+    parser.add_argument(
+        "--filter",
+        action="append",
+        default=[],
+        metavar="EXPR",
+        help="filter configurations; repeated expressions are combined with AND",
+    )
+    parser.add_argument("--accuracy", choices=tuple(PRESETS), default="balanced")
+    parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--workers", type=int, default=24)
+    parser.add_argument("--timeout", type=float, default=1.0)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--format", choices=("csv", "json", "table"), default="csv")
+    parser.add_argument("--ascii", action="store_true")
+    parser.add_argument(
+        "--colourblind", "--colorblind", action="store_true", help="use a blue-to-orange latency palette"
+    )
+    parser.add_argument("--no-colour", "--no-color", action="store_true", help="disable terminal colour output")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--auto-connect", action="store_true", help="connect to the selected ranked server using the NordVPN Linux CLI"
+    )
+    parser.add_argument(
+        "--connect-rank", type=int, default=1, help="rank to connect to when --auto-connect is enabled (default: 1)"
+    )
+    parser.add_argument(
+        "--replace-connection",
+        action="store_true",
+        help="allow replacing an existing NordVPN connection without prompting",
+    )
+    args = parser.parse_args(argv)
+    if args.top < 1 or not 1 <= args.workers <= 128 or not 0.1 <= args.timeout <= 30:
+        parser.error("--top must be positive, --workers 1..128, --timeout 0.1..30")
+    if args.connect_rank < 1 or (args.auto_connect and args.connect_rank > args.top):
+        parser.error("--connect-rank must be between 1 and --top")
+    if (args.connect_rank != 1 or args.replace_connection) and not args.auto_connect:
+        parser.error("--connect-rank and --replace-connection require --auto-connect")
+    try:
+        filters = [compile_filter(expression) for expression in args.filter]
+    except FilterSyntaxError as exc:
+        parser.error(f"invalid --filter: {exc}")
+    if shutil.which("ping") is None:
+        parser.error("system ping utility is required")
+    try:
+        with tempfile.TemporaryDirectory(prefix="nordvpn-benchmark-") as temp:
+            root = Path(temp)
+            if args.download:
+                extract_archive(root, lambda msg: None if args.quiet else print(msg, file=sys.stderr), args.protocol)
+                config_dir = root / "profiles"
+            else:
+                config_dir = args.config_dir.expanduser()
+                if not config_dir.is_dir():
+                    parser.error(f"configuration directory does not exist: {config_dir}")
+            endpoints = []
+            invalid = 0
+            filtered = 0
+            for path in sorted(config_dir.rglob("*.ovpn")):
+                try:
+                    for endpoint in parse_profile(path):
+                        if args.protocol == "both" or endpoint.protocol == args.protocol:
+                            if all(predicate(endpoint) for predicate in filters):
+                                endpoints.append(endpoint)
+                            else:
+                                filtered += 1
+                except (ValueError, UnicodeError, OSError) as exc:
+                    invalid += 1
+                    if args.verbose:
+                        print(f"Skipping {path}: {exc}", file=sys.stderr)
+            if not endpoints:
+                parser.error("no matching valid OpenVPN endpoints found (check --protocol and --filter)")
+            # ICMP is IP-scoped, not OpenVPN-port-scoped. Hostnames are left as hostnames.
+            addresses = sorted({e.host for e in endpoints})
+            random.Random(0).shuffle(addresses)
+            survey, additional = PRESETS[args.accuracy]
+            if not args.quiet:
+                print(
+                    f"Found {len(endpoints)} endpoints across {len(addresses)} addresses ({invalid} invalid profiles, {filtered} filtered endpoints)",
+                    file=sys.stderr,
+                )
+            measurements = execute_stage(addresses, survey, args.timeout, args.workers, "Survey", args.quiet)
+            # Keep a broad shortlist, including borderline results. This remains a heuristic.
+            shortlist_size = min(len(addresses), max(args.top * 3, 20))
+            shortlist = sorted(addresses, key=lambda a: rank(measurements[a]))[:shortlist_size]
+            refined = execute_stage(shortlist, additional, args.timeout, args.workers, "Refinement", args.quiet)
+            for address, extra in refined.items():
+                initial = measurements[address]
+                initial.attempted += extra.attempted
+                initial.samples.extend(extra.samples)
+                initial.stage = "refined"
+                initial.error = "" if initial.samples else extra.error
+            records = records_for(endpoints, measurements)
+            print(
+                format_results(
+                    records,
+                    args.top,
+                    args.ascii,
+                    colour=not args.no_colour and terminal_colour_enabled(),
+                    colourblind=args.colourblind,
+                )
+            )
+            if args.output:
+                destination = args.output.expanduser()
+                export(records, destination, args.format, args.ascii)
+                if not args.quiet:
+                    print(f"Wrote {len(records)} results to {destination}", file=sys.stderr)
+            if args.auto_connect:
+                from nordvpn_connection import ConnectionError, connect
+
+                def confirm(existing, selected):
+                    if not sys.stdin.isatty():
+                        return False
+                    answer = input(
+                        f"Replace existing VPN connection ({existing or 'unknown server'}) with {selected}? [y/N] "
+                    )
+                    return answer.strip().lower() in ("y", "yes")
+
+                try:
+                    connect(records, args.connect_rank, replace_existing=args.replace_connection, confirm=confirm)
+                except ConnectionError as exc:
+                    print(f"Connection error: {exc}", file=sys.stderr)
+                    return 2
+        return 0
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

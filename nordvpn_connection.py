@@ -1,0 +1,97 @@
+"""Opt-in NordVPN Linux CLI connection support.
+
+No benchmark operation imports or calls this module unless connection is requested.
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+
+SERVER_ID = re.compile(r"^(?P<id>[a-z]{2}[0-9]+)\.nordvpn\.com$", re.I)
+
+
+class ConnectionError(RuntimeError):
+    """A connection could not be made or verified safely."""
+
+
+@dataclass(frozen=True)
+class ConnectionState:
+    connected: bool
+    server: str | None
+    raw: str
+
+
+def run_client(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(["nordvpn", *args], capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ConnectionError(f"nordvpn {args[0]} timed out") from exc
+    except OSError as exc:
+        raise ConnectionError(f"cannot execute nordvpn: {exc}") from exc
+
+
+def status() -> ConnectionState:
+    result = run_client("status")
+    if result.returncode:
+        raise ConnectionError(f"cannot read NordVPN status: {(result.stderr or result.stdout).strip()}")
+    raw = result.stdout
+    match = re.search(r"^Status:\s*(Connected|Disconnected)\s*$", raw, re.I | re.M)
+    if not match:
+        raise ConnectionError("NordVPN status format is not recognised; refusing to change the connection")
+    connected = match.group(1).lower() == "connected"
+    server_match = re.search(r"^Current server:\s*(\S+)\s*$", raw, re.I | re.M)
+    return ConnectionState(connected, server_match.group(1).lower() if server_match else None, raw)
+
+
+def connect(records: list[dict], rank: int, *, replace_existing: bool = False, confirm=None, stream=None) -> str:
+    """Connect to the selected rank and verify the actual NordVPN status.
+
+    A ranked record is an OpenVPN profile, not necessarily a NordVPN CLI server.
+    Only canonical hostnames can be mapped to a CLI identifier; an IP address
+    alone does not prove that identity. No implicit fallback to another server.
+    """
+    stream = stream or sys.stderr
+    if sys.platform != "linux":
+        raise ConnectionError("--auto-connect currently supports Linux only")
+    if shutil.which("nordvpn") is None:
+        raise ConnectionError("NordVPN Linux CLI not found in PATH")
+    if rank < 1 or rank > len(records):
+        raise ConnectionError(f"--connect-rank must be between 1 and {len(records)}")
+    record = records[rank - 1]
+    if not record.get("received", 0):
+        raise ConnectionError("selected server has no successful ICMP samples; refusing automatic connection")
+    filename = record["server"]
+    # The canonical name is carried by NordVPN profile filenames even when the
+    # remote directive is a numeric IP address.
+    match = SERVER_ID.fullmatch(filename)
+    if not match:
+        raise ConnectionError(f"cannot derive a NordVPN server identifier from {filename!r}")
+    hostname = filename.lower()
+    server_id = match.group("id").lower()
+    current = status()
+    if current.connected:
+        if current.server and current.server.lower() in (hostname, server_id):
+            print(f"Already connected to {hostname}; no change required.", file=stream)
+            return hostname
+        if not replace_existing:
+            if confirm is None or not confirm(current.server, hostname):
+                raise ConnectionError(
+                    "existing VPN connection left unchanged; use --replace-connection to authorise replacement"
+                )
+    print(f"Connecting to {hostname} using the NordVPN client...", file=stream)
+    result = run_client("connect", server_id, timeout=90)
+    if result.returncode:
+        raise ConnectionError(f"NordVPN connection failed: {(result.stderr or result.stdout).strip()}")
+    actual = status()
+    if not actual.connected:
+        raise ConnectionError("NordVPN reported success but its status is not connected")
+    if not actual.server:
+        raise ConnectionError("NordVPN is connected, but did not report the server identity")
+    if actual.server.lower() not in (hostname, server_id):
+        raise ConnectionError(f"NordVPN connected to {actual.server}, not requested {hostname}")
+    print(f"Connected and verified: {actual.server}", file=stream)
+    return actual.server
