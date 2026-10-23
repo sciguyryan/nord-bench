@@ -465,6 +465,57 @@ def tcp_refinement_shortlist(endpoints, survey_results, top):
     return [candidate[2] for _, candidate in ordered[:limit]]
 
 
+def merge_refinement(measurements, additions):
+    """Accumulate additional attempts without discarding survey observations."""
+    for target, extra in additions.items():
+        initial = measurements[target]
+        initial.attempted += extra.attempted
+        initial.samples.extend(extra.samples)
+        initial.stage = "refined"
+        initial.error = "" if initial.samples else extra.error
+
+
+def adaptive_contenders(shortlist, measurements, top):
+    """Conservatively retain leaders and candidates with overlapping robust ranges.
+
+    This heuristic is not a confidence interval or a significance test. Its
+    minimum 1 ms tolerance reduces premature elimination of close candidates.
+    """
+    responsive = sorted(
+        (target for target in shortlist if measurements[target].samples),
+        key=lambda target: (rank(measurements[target]), target),
+    )
+    if not responsive:
+        return list(shortlist)
+    leader = measurements[responsive[0]]
+    leader_upper = leader.median + max(1.0, 3 * leader.jitter)
+    selected = set(responsive[:top])
+    for target in responsive:
+        candidate = measurements[target]
+        if candidate.median - max(1.0, 3 * candidate.jitter) <= leader_upper:
+            selected.add(target)
+    # Keep non-responsive shortlisted targets eligible for a second chance.
+    selected.update(target for target in shortlist if not measurements[target].samples)
+    return [target for target in shortlist if target in selected]
+
+
+def adaptive_refine(shortlist, measurements, additional, top, probe, timeout, workers, quiet):
+    """Refine every shortlisted target once, then spend remaining samples on contenders.
+
+    Total per-target attempts never exceed the selected accuracy preset.
+    """
+    first = min(additional, max(4, additional // 2))
+    second = additional - first
+    executor = execute_tcp_stage if probe == "tcp" else execute_stage
+    label = "TCP" if probe == "tcp" else "ICMP"
+    merge_refinement(measurements, executor(shortlist, first, timeout, workers, f"{label} refinement 1/2", quiet))
+    if second:
+        contenders = adaptive_contenders(shortlist, measurements, top)
+        if not quiet:
+            print(f"Adaptive refinement: {len(contenders)}/{len(shortlist)} targets retained", file=sys.stderr)
+        merge_refinement(measurements, executor(contenders, second, timeout, workers, f"{label} refinement 2/2", quiet))
+
+
 def distinct_servers(records):
     unique = {}
     for record in records:
@@ -631,6 +682,9 @@ def main(argv=None):
     )
     parser.add_argument("--accuracy", choices=tuple(PRESETS), default="balanced")
     parser.add_argument("--top", type=int, default=10)
+    parser.add_argument(
+        "--adaptive", action="store_true", help="allocate the second refinement round to leading and uncertain targets"
+    )
     parser.add_argument(
         "--stability", action="store_true", help="show exploratory bootstrap median intervals for ranked servers"
     )
@@ -801,15 +855,15 @@ def main(argv=None):
                 shortlist_size = min(len(addresses), max(args.top * 3, 20))
                 shortlist = sorted(addresses, key=lambda a: rank(measurements[a]))[:shortlist_size]
                 phase_header("Refinement", ascii_only=args.ascii, quiet=args.quiet, separate=True)
-                refined = execute_stage(
-                    shortlist, additional, args.timeout, args.workers, "ICMP refinement", args.quiet
-                )
-                for address, extra in refined.items():
-                    initial = measurements[address]
-                    initial.attempted += extra.attempted
-                    initial.samples.extend(extra.samples)
-                    initial.stage = "refined"
-                    initial.error = "" if initial.samples else extra.error
+                if args.adaptive:
+                    adaptive_refine(
+                        shortlist, measurements, additional, args.top, "icmp", args.timeout, args.workers, args.quiet
+                    )
+                else:
+                    merge_refinement(
+                        measurements,
+                        execute_stage(shortlist, additional, args.timeout, args.workers, "ICMP refinement", args.quiet),
+                    )
             if args.probe == "tcp":
                 targets = tcp_targets
                 if targets:
@@ -818,15 +872,17 @@ def main(argv=None):
                     )
                     shortlist = tcp_refinement_shortlist(endpoints, tcp_results, args.top)
                     phase_header("Refinement", ascii_only=args.ascii, quiet=args.quiet, separate=True)
-                    refined = execute_tcp_stage(
-                        shortlist, additional, args.timeout, args.workers, "TCP refinement", args.quiet
-                    )
-                    for target, extra in refined.items():
-                        initial = tcp_results[target]
-                        initial.attempted += extra.attempted
-                        initial.samples.extend(extra.samples)
-                        initial.stage = "refined"
-                        initial.error = "" if initial.samples else extra.error
+                    if args.adaptive:
+                        adaptive_refine(
+                            shortlist, tcp_results, additional, args.top, "tcp", args.timeout, args.workers, args.quiet
+                        )
+                    else:
+                        merge_refinement(
+                            tcp_results,
+                            execute_tcp_stage(
+                                shortlist, additional, args.timeout, args.workers, "TCP refinement", args.quiet
+                            ),
+                        )
                     measurements = tcp_results
             # TCP records are port-scoped. ICMP results remain address-scoped.
             if args.probe == "tcp":
@@ -872,11 +928,17 @@ def main(argv=None):
                         "filters": args.filter,
                         "region_lists": args.region_list,
                         "stability_enabled": args.stability,
+                        "adaptive_enabled": args.adaptive,
                     },
                     source=source_info,
                     methodology={
                         "survey_samples_per_target": survey,
                         "refinement_additional_samples_per_target": additional,
+                        "adaptive_refinement": (
+                            "two rounds, robust-range contender selection; maximum per-target attempts unchanged"
+                            if args.adaptive
+                            else "disabled; fixed refinement samples"
+                        ),
                         "ranking": "responsiveness, loss, median latency, median absolute deviation",
                         "tcp_refinement": "one representative port per server and destination IP",
                         "latency_unit": "milliseconds",
