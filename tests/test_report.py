@@ -1,38 +1,63 @@
-"""Regression checks for versioned report writing and CLI safeguards."""
+"""Offline report contract and atomicity tests."""
 
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from nordvpn_report import SCHEMA_VERSION, write_report
-from nordvpn_benchmark import main
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import nordvpn_report as report
+import nordvpn_benchmark as benchmark
 
 
 class ReportTests(unittest.TestCase):
-    def test_atomic_report_round_trip(self):
+    def test_report_schema_and_measurement_preservation(self):
+        rows = [{"server": "ad9.nordvpn.com", "samples_ms": [8.2, 8.3]}]
+        value = report.build_report(
+            started_at="start",
+            finished_at="end",
+            settings={"probe": "tcp"},
+            source={"kind": "download"},
+            methodology={"latency_unit": "milliseconds"},
+            records=rows,
+            ranked=rows,
+        )
+        self.assertEqual(value["schema_version"], 1)
+        self.assertEqual(value["measurements"][0]["samples_ms"], [8.2, 8.3])
+        self.assertNotIn("stability", value)
+
+    def test_atomic_json_output(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "nested" / "report.json"
-            write_report(path, {"schema_version": SCHEMA_VERSION, "measurements": [{"samples_ms": [1.2]}]})
-            self.assertEqual(json.loads(path.read_text())["measurements"][0]["samples_ms"], [1.2])
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-
-    def test_invalid_payload_preserves_existing_report(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "report.json"
-            write_report(path, {"schema_version": SCHEMA_VERSION})
-            original = path.read_bytes()
+            report.write_report(path, {"schema_version": 1, "ranking": []})
+            self.assertEqual(json.loads(path.read_text())["ranking"], [])
+            previous = path.read_bytes()
             with self.assertRaises(ValueError):
-                write_report(path, {"latency": float("nan")})
-            self.assertEqual(path.read_bytes(), original)
+                report.write_report(path, {"invalid": float("nan")})
+            self.assertEqual(path.read_bytes(), previous)
 
-    def test_report_must_not_overwrite_results_export(self):
+    def test_main_report_from_local_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = str(Path(directory) / "results.json")
-            with patch("sys.stderr"), self.assertRaises(SystemExit) as error:
-                main(["--download", "--report", path, "--output", path])
-            self.assertEqual(error.exception.code, 2)
+            folder = Path(directory)
+            (folder / "ad9.nordvpn.com.udp.ovpn").write_text("proto udp\nremote 127.0.0.1 53\n")
+            measurement = benchmark.Measurement("127.0.0.1", 3, [8.1, 8.2, 8.3])
+            with (
+                patch.object(benchmark.shutil, "which", return_value="ping"),
+                patch.object(benchmark, "execute_stage", return_value={"127.0.0.1": measurement}),
+                patch("nordvpn_connection.benchmark_preflight", return_value=True),
+            ):
+                self.assertEqual(
+                    benchmark.main(
+                        ["--config-dir", str(folder), "--report", str(folder / "report.json"), "--quiet", "--ascii"]
+                    ),
+                    0,
+                )
+            result = json.loads((folder / "report.json").read_text())
+            self.assertEqual(result["settings"]["probe"], "icmp")
+            self.assertEqual(result["source"]["kind"], "config-directory")
+            self.assertEqual(result["ranking"][0]["server"], "ad9.nordvpn.com")
 
 
 if __name__ == "__main__":

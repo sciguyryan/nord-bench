@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from nordvpn_report import build_report, timestamp, write_report
 import concurrent.futures as futures
 import csv
 import hashlib
@@ -21,7 +22,6 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from urllib.request import urlopen
 import zipfile
 
@@ -637,7 +637,7 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=24)
     parser.add_argument("--timeout", type=float, default=1.0)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--report", type=Path, help="write a versioned JSON report with benchmark settings and results")
+    parser.add_argument("--report", type=Path, help="write a versioned, self-contained JSON benchmark report")
     parser.add_argument("--format", choices=("csv", "json", "table"), default="csv")
     parser.add_argument("--ascii", action="store_true")
     parser.add_argument(
@@ -653,9 +653,6 @@ def main(argv=None):
     )
     parser.add_argument(
         "--auto-connect", action="store_true", help="connect to the selected ranked server using the NordVPN Linux CLI"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="preview the selected auto-connect command without changing VPN state"
     )
     parser.add_argument(
         "--connect-rank", type=int, default=1, help="rank to connect to when --auto-connect is enabled (default: 1)"
@@ -676,10 +673,8 @@ def main(argv=None):
         parser.error("--top must be positive, --workers 1..128, --timeout 0.1..30")
     if args.connect_rank < 1 or (args.auto_connect and args.connect_rank > args.top):
         parser.error("--connect-rank must be between 1 and --top")
-    if args.report and args.output and args.report.expanduser().resolve() == args.output.expanduser().resolve():
-        parser.error("--report and --output must use different paths")
-    if (args.connect_rank != 1 or args.replace_connection or args.dry_run) and not args.auto_connect:
-        parser.error("--connect-rank, --replace-connection and --dry-run require --auto-connect")
+    if (args.connect_rank != 1 or args.replace_connection) and not args.auto_connect:
+        parser.error("--connect-rank and --replace-connection require --auto-connect")
     if args.probe == "tcp" and args.protocol == "udp" and not args.list_region_lists:
         parser.error("--probe tcp requires --protocol tcp or --protocol both")
     try:
@@ -702,7 +697,7 @@ def main(argv=None):
         return 2
     if args.probe == "icmp" and shutil.which("ping") is None:
         parser.error("system ping utility is required")
-    started_at = datetime.now(timezone.utc).isoformat()
+    started_at = timestamp()
     try:
         phase_header("Configuration", ascii_only=args.ascii, quiet=args.quiet)
         if not args.quiet:
@@ -716,7 +711,7 @@ def main(argv=None):
             root = Path(temp)
             phase_header("Server discovery", ascii_only=args.ascii, quiet=args.quiet, separate=True)
             endpoints = []
-            catalogue_source = None
+            source_info = {"kind": "download" if args.download else "config-directory"}
             invalid = 0
             filtered = 0
             if args.download and not args.no_cache:
@@ -731,9 +726,17 @@ def main(argv=None):
                     force=args.refresh_cache,
                     offline=args.offline,
                 )
-                from nordvpn_cache import load
+                from nordvpn_cache import load as load_cache
 
-                catalogue_source = dict(load(cache_path, ARCHIVE_URL)["source"])
+                cache_metadata = load_cache(cache_path, ARCHIVE_URL)["source"]
+                source_info.update(
+                    {
+                        "url": ARCHIVE_URL,
+                        "archive_sha256": cache_metadata["sha256"],
+                        "checked_at": cache_metadata["checked_at"],
+                        "catalogue_schema": 1,
+                    }
+                )
                 for entry in catalogue:
                     endpoint = Endpoint(**entry)
                     if not eligible(endpoint.file):
@@ -750,8 +753,10 @@ def main(argv=None):
                         root, lambda msg: None if args.quiet else print(msg, file=sys.stderr), args.protocol, eligible
                     )
                     config_dir = root / "profiles"
+                    source_info["url"] = ARCHIVE_URL
                 else:
                     config_dir = args.config_dir.expanduser()
+                    source_info["path"] = str(config_dir.resolve())
                     if not config_dir.is_dir():
                         parser.error(f"configuration directory does not exist: {config_dir}")
                 for path in sorted(config_dir.rglob("*.ovpn")):
@@ -847,26 +852,11 @@ def main(argv=None):
                 if not args.quiet:
                     print(f"Wrote {len(records)} results to {destination}", file=sys.stderr)
             if args.report:
-                from nordvpn_report import SCHEMA_VERSION, write_report
-
-                report = {
-                    "schema_version": SCHEMA_VERSION,
-                    "started_at": started_at,
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                    "methodology": {
+                report = build_report(
+                    started_at=started_at,
+                    finished_at=timestamp(),
+                    settings={
                         "probe": args.probe,
-                        "ranking": "responsive first, then loss, median, MAD and deterministic identity tie-breaks",
-                        "survey_samples_per_target": survey,
-                        "refinement_additional_samples_per_target": additional,
-                        "refinement": "one representative TCP port per server/address"
-                        if args.probe == "tcp"
-                        else "address shortlist",
-                        "stability": "deterministic exploratory 90% bootstrap median intervals"
-                        if args.stability
-                        else None,
-                    },
-                    "settings": {
-                        "source": "download" if args.download else "local",
                         "protocol": args.protocol,
                         "accuracy": args.accuracy,
                         "top": args.top,
@@ -874,32 +864,26 @@ def main(argv=None):
                         "timeout_seconds": args.timeout,
                         "filters": args.filter,
                         "region_lists": args.region_list,
+                        "stability_enabled": args.stability,
                     },
-                    "source": {
-                        "archive_url": ARCHIVE_URL if args.download else None,
-                        "archive_sha256": catalogue_source["sha256"] if catalogue_source else None,
-                        "cache_checked_at": catalogue_source["checked_at"] if catalogue_source else None,
-                        "note": "Archive digest unavailable when persistent catalogue is bypassed"
-                        if args.download and not catalogue_source
-                        else None,
+                    source=source_info,
+                    methodology={
+                        "survey_samples_per_target": survey,
+                        "refinement_additional_samples_per_target": additional,
+                        "ranking": "responsiveness, loss, median latency, median absolute deviation",
+                        "tcp_refinement": "one representative port per server and destination IP",
+                        "latency_unit": "milliseconds",
+                        "probe_description": (
+                            "TCP connection establishment" if args.probe == "tcp" else "ICMP echo round trip"
+                        ),
                     },
-                    "counts": {
-                        "eligible_endpoints": len(endpoints),
-                        "measured_endpoints": len(records),
-                        "distinct_servers": len(ranked),
-                        "invalid_profiles": invalid,
-                        "filtered_endpoints": filtered,
-                    },
-                    "rankings": ranked,
-                    "measurements": records,
-                    "stability_diagnostics": stability_report(ranked, measurements, top=args.top)
-                    if args.stability
-                    else None,
-                }
-                destination = args.report.expanduser()
-                write_report(destination, report)
+                    records=records,
+                    ranked=ranked,
+                    stability=stability_report(ranked, measurements, top=args.top) if args.stability else None,
+                )
+                write_report(args.report.expanduser(), report)
                 if not args.quiet:
-                    print(f"Wrote benchmark report to {destination}", file=sys.stderr)
+                    print(f"Wrote benchmark report to {args.report}", file=sys.stderr)
             if args.auto_connect and (args.connect_rank > len(ranked) or not ranked[args.connect_rank - 1]["received"]):
                 print(
                     "Connection error: selected rank has no successful probe; cannot identify a fastest server.",
@@ -909,7 +893,7 @@ def main(argv=None):
             if args.auto_connect:
                 if not args.quiet:
                     print(file=sys.stderr)
-                from nordvpn_connection import ConnectionError, connect, preview_connection
+                from nordvpn_connection import ConnectionError, connect
 
                 def confirm(existing, selected):
                     if not sys.stdin.isatty():
@@ -920,10 +904,7 @@ def main(argv=None):
                     return answer.strip().lower() in ("y", "yes")
 
                 try:
-                    if args.dry_run:
-                        preview_connection(ranked, args.connect_rank, replace_existing=args.replace_connection)
-                    else:
-                        connect(ranked, args.connect_rank, replace_existing=args.replace_connection, confirm=confirm)
+                    connect(ranked, args.connect_rank, replace_existing=args.replace_connection, confirm=confirm)
                 except ConnectionError as exc:
                     print(f"Connection error: {exc}", file=sys.stderr)
                     return 2

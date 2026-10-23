@@ -244,18 +244,6 @@ For automatic connection verification, the Linux CLI status parser recognises th
 
 ### Reproducible benchmark reports
 
-Use `--report benchmark-report.json` to write a separate versioned JSON report alongside the normal terminal results and optional `--output` export. The report records UTC start and completion timestamps, selected benchmark settings, probe and sampling methodology, catalogue provenance where available, endpoint counts, distinct-server rankings and all per-endpoint measurements including unsuccessful probes and individual latency samples. The report is written atomically with restrictive file permissions, and `--report` must not point to the same file as `--output`.
+Use `--report benchmark-report.json` to write a separate, versioned JSON report alongside the existing `--output` CSV, JSON or table export. The report contains UTC start and completion timestamps, the selected probe method and benchmark settings, source catalogue provenance where available, sampling methodology, every per-endpoint measurement (including failed probes and individual samples), the distinct-server ranking and optional stability diagnostics. The report is written atomically so an interrupted write cannot replace a previous complete report. The report describes a completed measurement run, not a promise that later network measurements will be identical. For cached downloads, the source SHA-256 identifies the downloaded archive; it is not an independently authenticated publisher checksum. When using a local configuration directory or bypassing the derived cache, an archive digest is not available and is not invented. Reports do not include VPN credentials or OpenVPN profile contents.
 
-```bash
-python nordvpn_benchmark.py --download --protocol tcp --probe tcp --region-list low-ads --stability --report benchmark-report.json
-```
-
-The report schema starts at version 1. The archive SHA-256 is available when the persistent derived endpoint cache is used; local profiles and `--no-cache` downloads currently have no recorded archive digest, and the report explicitly represents that absence as `null`. Reports preserve the measurements and their methodology, but network latency is inherently variable, so identical settings cannot guarantee identical future results. Existing CSV and JSON export contracts remain unchanged. Reports contain endpoint IP addresses and server identities; treat them as operational data and review them before sharing.
-
-### Preview automatic connection
-
-Use `--auto-connect --dry-run` to benchmark normally and display the selected rank and proposed `nordvpn connect` command without changing the VPN connection. The preview checks the current NordVPN CLI status where available, reports an existing connection and whether `--replace-connection` would authorise its replacement, and never executes a connection command. It does not bypass the normal active-VPN benchmarking preflight: use `--allow-active-vpn` explicitly if benchmarking over an existing NordVPN connection is intentional. A dry run cannot verify the identity of a future connection, and the VPN state may change after the preview. `--dry-run` requires `--auto-connect`.
-
-```bash
-python nordvpn_benchmark.py --download --protocol tcp --probe tcp --auto-connect --dry-run --top 10
-```
+Example: `python nordvpn_benchmark.py --download --protocol tcp --probe tcp --accuracy balanced --stability --report benchmark-report.json`
