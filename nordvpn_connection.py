@@ -100,6 +100,44 @@ def benchmark_preflight(*, allow_active_vpn: bool = False, stream=None) -> bool:
     return False
 
 
+def preview_connection(records: list[dict], rank: int, *, replace_existing: bool = False, stream=None) -> str:
+    """Describe the connection plan without executing a NordVPN connection.
+
+    Reading the installed client's status is permitted. Never invoke connect,
+    disconnect, or any other command that changes VPN state.
+    """
+    stream = stream or sys.stderr
+    if sys.platform != "linux":
+        raise ConnectionError("--auto-connect currently supports Linux only")
+    if shutil.which("nordvpn") is None:
+        raise ConnectionError("NordVPN Linux CLI not found in PATH")
+    if rank < 1 or rank > len(records):
+        raise ConnectionError(f"--connect-rank must be between 1 and {len(records)}")
+    record = records[rank - 1]
+    if not record.get("received", 0):
+        raise ConnectionError("selected server has no successful probe samples; refusing automatic connection")
+    hostname = str(record["server"]).lower()
+    match = SERVER_ID.fullmatch(hostname)
+    if not match:
+        raise ConnectionError(f"cannot derive a NordVPN server identifier from {hostname!r}")
+    server_id = match.group("id").lower()
+    current = status()
+    print(f"Dry run: selected rank {rank}: {hostname}", file=stream)
+    if current.connected and current.server == hostname:
+        print(f"Dry run: already connected to {hostname}; no connection command needed.", file=stream)
+        return "already-connected"
+    if current.connected:
+        print(f"Dry run: existing VPN connection: {current.server or 'unknown server'}.", file=stream)
+        if not replace_existing:
+            print("Dry run: replacement would require interactive confirmation or --replace-connection.", file=stream)
+            print("Dry run: no connection command would run without that authorisation.", file=stream)
+            return "confirmation-required"
+        print("Dry run: --replace-connection authorises replacing the existing connection.", file=stream)
+    print(f"Dry run: would execute: nordvpn connect {server_id}", file=stream)
+    print("Dry run: no VPN connection was changed; server identity would be verified afterwards.", file=stream)
+    return "ready"
+
+
 def connect(records: list[dict], rank: int, *, replace_existing: bool = False, confirm=None, stream=None) -> str | None:
     """Connect to the selected rank and verify the actual NordVPN status.
 

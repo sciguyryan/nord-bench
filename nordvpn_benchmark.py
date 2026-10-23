@@ -655,6 +655,11 @@ def main(argv=None):
         "--auto-connect", action="store_true", help="connect to the selected ranked server using the NordVPN Linux CLI"
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="preview the selected NordVPN connection without changing VPN state (requires --auto-connect)",
+    )
+    parser.add_argument(
         "--connect-rank", type=int, default=1, help="rank to connect to when --auto-connect is enabled (default: 1)"
     )
     parser.add_argument(
@@ -673,6 +678,8 @@ def main(argv=None):
         parser.error("--top must be positive, --workers 1..128, --timeout 0.1..30")
     if args.connect_rank < 1 or (args.auto_connect and args.connect_rank > args.top):
         parser.error("--connect-rank must be between 1 and --top")
+    if args.dry_run and not args.auto_connect:
+        parser.error("--dry-run requires --auto-connect")
     if (args.connect_rank != 1 or args.replace_connection) and not args.auto_connect:
         parser.error("--connect-rank and --replace-connection require --auto-connect")
     if args.probe == "tcp" and args.protocol == "udp" and not args.list_region_lists:
@@ -893,7 +900,7 @@ def main(argv=None):
             if args.auto_connect:
                 if not args.quiet:
                     print(file=sys.stderr)
-                from nordvpn_connection import ConnectionError, connect
+                from nordvpn_connection import ConnectionError, connect, preview_connection
 
                 def confirm(existing, selected):
                     if not sys.stdin.isatty():
@@ -904,7 +911,10 @@ def main(argv=None):
                     return answer.strip().lower() in ("y", "yes")
 
                 try:
-                    connect(ranked, args.connect_rank, replace_existing=args.replace_connection, confirm=confirm)
+                    if args.dry_run:
+                        preview_connection(ranked, args.connect_rank, replace_existing=args.replace_connection)
+                    else:
+                        connect(ranked, args.connect_rank, replace_existing=args.replace_connection, confirm=confirm)
                 except ConnectionError as exc:
                     print(f"Connection error: {exc}", file=sys.stderr)
                     return 2

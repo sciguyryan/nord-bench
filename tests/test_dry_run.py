@@ -1,55 +1,81 @@
-"""Dry-run must never invoke NordVPN connection or disconnection commands."""
+"""Dry-run connection planning must never mutate VPN state."""
 
 import io
+import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-import nordvpn_connection as connection
-from nordvpn_benchmark import main
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import nordvpn_benchmark as b
+import nordvpn_connection as c
 
 
 class DryRunTests(unittest.TestCase):
-    def setUp(self):
-        self.rows = [{"server": "uk715.nordvpn.com", "received": 3}]
+    rows = [{"server": "uk715.nordvpn.com", "received": 3}]
 
-    @patch.object(connection.sys, "platform", "linux")
-    @patch.object(connection.shutil, "which", return_value="/usr/bin/nordvpn")
+    @patch.object(c.sys, "platform", "linux")
+    @patch.object(c.shutil, "which", return_value="/usr/bin/nordvpn")
     def test_disconnected_preview_only_reads_status(self, _which):
-        output = io.StringIO()
-        with patch.object(connection, "run_client", return_value=self.result("Status: Disconnected\n")) as run:
-            self.assertTrue(connection.preview_connection(self.rows, 1, stream=output))
-        self.assertEqual([call.args[0] for call in run.call_args_list], ["status"])
-        self.assertIn("nordvpn connect uk715", output.getvalue())
-
-    @patch.object(connection.sys, "platform", "linux")
-    @patch.object(connection.shutil, "which", return_value="/usr/bin/nordvpn")
-    def test_existing_connection_requires_authorisation(self, _which):
+        out = io.StringIO()
         with patch.object(
-            connection, "run_client", return_value=self.result("Status: Connected\nHostname: de123\n")
+            c, "run_client", return_value=c.subprocess.CompletedProcess([], 0, "Status: Disconnected\n", "")
         ) as run:
-            self.assertFalse(connection.preview_connection(self.rows, 1, stream=io.StringIO()))
-            self.assertTrue(connection.preview_connection(self.rows, 1, replace_existing=True, stream=io.StringIO()))
-        self.assertEqual([call.args[0] for call in run.call_args_list], ["status", "status"])
+            self.assertEqual(c.preview_connection(self.rows, 1, stream=out), "ready")
+            run.assert_called_once_with("status")
+        self.assertIn("nordvpn connect uk715", out.getvalue())
 
-    @patch.object(connection.sys, "platform", "linux")
-    @patch.object(connection.shutil, "which", return_value="/usr/bin/nordvpn")
-    def test_unknown_status_fails_closed(self, _which):
-        with patch.object(connection, "run_client", return_value=self.result("unrecognised")) as run:
-            self.assertFalse(connection.preview_connection(self.rows, 1, stream=io.StringIO()))
-        run.assert_called_once()
+    @patch.object(c.sys, "platform", "linux")
+    @patch.object(c.shutil, "which", return_value="/usr/bin/nordvpn")
+    def test_existing_connection_requires_authorisation(self, _which):
+        out = io.StringIO()
+        with patch.object(
+            c,
+            "run_client",
+            return_value=c.subprocess.CompletedProcess([], 0, "Status: Connected\nHostname: de123.nordvpn.com\n", ""),
+        ) as run:
+            self.assertEqual(c.preview_connection(self.rows, 1, stream=out), "confirmation-required")
+            run.assert_called_once_with("status")
+        self.assertIn("confirmation", out.getvalue())
+        self.assertNotIn("would execute:", out.getvalue())
 
-    def test_invalid_server_does_not_call_client(self):
-        with patch.object(connection, "run_client") as run, self.assertRaises(connection.ConnectionError):
-            connection.preview_connection([{"server": "invalid", "received": 3}], 1)
-        run.assert_not_called()
+    @patch.object(c.sys, "platform", "linux")
+    @patch.object(c.shutil, "which", return_value="/usr/bin/nordvpn")
+    def test_replacement_authorised_but_not_executed(self, _which):
+        out = io.StringIO()
+        with patch.object(
+            c, "run_client", return_value=c.subprocess.CompletedProcess([], 0, "Status: Connected\n", "")
+        ) as run:
+            self.assertEqual(c.preview_connection(self.rows, 1, replace_existing=True, stream=out), "ready")
+            run.assert_called_once_with("status")
+        self.assertIn("would execute: nordvpn connect uk715", out.getvalue())
 
-    def test_cli_requires_auto_connect(self):
-        with patch("sys.stderr"), self.assertRaises(SystemExit) as error:
-            main(["--download", "--dry-run"])
-        self.assertEqual(error.exception.code, 2)
+    @patch.object(c.sys, "platform", "linux")
+    @patch.object(c.shutil, "which", return_value="/usr/bin/nordvpn")
+    def test_already_connected(self, _which):
+        out = io.StringIO()
+        with patch.object(
+            c,
+            "run_client",
+            return_value=c.subprocess.CompletedProcess([], 0, "Status: Connected\nHostname: uk715.nordvpn.com\n", ""),
+        ) as run:
+            self.assertEqual(c.preview_connection(self.rows, 1, stream=out), "already-connected")
+            run.assert_called_once_with("status")
+        self.assertIn("no connection command needed", out.getvalue())
 
-    @staticmethod
-    def result(stdout):
-        from subprocess import CompletedProcess
+    @patch.object(c.sys, "platform", "linux")
+    @patch.object(c.shutil, "which", return_value="/usr/bin/nordvpn")
+    def test_reject_unmeasured_before_status(self, _which):
+        with patch.object(c, "status") as status:
+            with self.assertRaisesRegex(c.ConnectionError, "no successful"):
+                c.preview_connection([{"server": "uk715.nordvpn.com", "received": 0}], 1)
+            status.assert_not_called()
 
-        return CompletedProcess(["nordvpn"], 0, stdout, "")
+    def test_dry_run_requires_auto_connect(self):
+        with self.assertRaises(SystemExit) as exc:
+            b.main(["--download", "--dry-run"])
+        self.assertEqual(exc.exception.code, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
